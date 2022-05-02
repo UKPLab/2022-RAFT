@@ -45,7 +45,8 @@ from transformers_modified import (
     HfArgumentParser,
     Trainer,
     set_seed,
-    AdamW
+    AdamW,
+    EvalPrediction
 )
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
@@ -196,7 +197,6 @@ def main():
     }
     if model_args.config_name:
         config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
-
     elif model_args.model_name_or_path:
         config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
     else:
@@ -240,22 +240,23 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
+        
     logger.info("Training new model from scratch")
-    student = AutoModelForMaskedLM.from_config(config)
-    
-    config.rational_layers = ['']
-    config.add_ln = False
-    teacher = AutoModelForMaskedLM.from_pretrained(
-        model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in model_args.model_name_or_path),
-        config=config,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-    )
-
-
-    student.resize_token_embeddings(len(tokenizer))
+    model = AutoModelForMaskedLM.from_config(config)
+    if model_args.model_name_or_path:
+        config.rational_layers = ['']
+        teacher = AutoModelForMaskedLM.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+        for p in teacher.parameters():
+            p.requires_grad=False 
+           
+    model.resize_token_embeddings(len(tokenizer))
     # for k,v in model.named_parameters():
     #     print(k,v)
     # exit()
@@ -406,25 +407,21 @@ def main():
         
     # set optimizer for rational and others
     rational = ['numerator','denominator']
-    no_decay = ["bias", "LayerNorm.weight"]
+    # no_decay = ["bias", "LayerNorm.weight"]
 
     grouped_params = [
-        {"params":[v for k, v in student.named_parameters() if any(param in k for param in rational)],
+        {"params":[v for k, v in model.named_parameters() if any(param in k for param in rational)],
         "lr": training_args.rational_lr,
         "weight_decay": training_args.weight_decay},
 
-        {"params":[v for k, v in student.named_parameters() if not any(param in k for param in rational) and any(param in k for param in no_decay)],
+        {"params":[v for k, v in model.named_parameters() if not any(param in k for param in rational)],
         "lr": training_args.learning_rate,
-        "weight_decay": 0.0},
+        "weight_decay": training_args.weight_decay},
 
-        {"params":[v for k, v in student.named_parameters() if not any(param in k for param in rational) and not any(param in k for param in no_decay)],
-        "lr": training_args.learning_rate,
-        "weight_decay": training_args.weight_decay},        
-
-            # {"params": [v for k, v in model.named_parameters() if not any(param in k for param in rational) and any(param in k for param in no_decay)],
-            # "lr": training_args.learning_rate,
-            # "weight_decay": 0.0}
-            ]
+        # {"params": [v for k, v in model.named_parameters() if not any(param in k for param in rational) and any(param in k for param in no_decay)],
+        # "lr": training_args.learning_rate,
+        # "weight_decay": 0.0}
+        ]
 
     # optimizer = AdamW(grouped_params, lr=training_args.learning_rate, weight_decay=training_args.weight_decay)
     optimizer = torch.optim.Adam(
@@ -433,10 +430,8 @@ def main():
 
 
     # Initialize our Trainer
-    # trainer = CustomTrainer(
-    #     student=student,
-    #     teacher = teacher,
-    #     kd_args = kd_args, 
+    # trainer = Trainer(
+    #     model=model,
     #     args=training_args,
     #     train_dataset=train_dataset if training_args.do_train else None,
     #     eval_dataset=eval_dataset if training_args.do_eval else None,
@@ -447,17 +442,19 @@ def main():
     #     # callbacks = [rationalcallback],
     #     optimizers=(optimizer, None)
     # )
-    trainer = Trainer(
-        model=student,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics if training_args.do_eval else None,
-        # preprocess_logits_for_metrics=preprocess_logits_for_metrics if training_args.do_eval else None,
-        # callbacks = [rationalcallback],
-        optimizers=(optimizer, None)
+    trainer = CustomTrainer(student=model,
+                teacher=teacher,
+                args=training_args,
+                kd_args=kd_args,
+                train_dataset=train_dataset if training_args.do_train else None,
+                eval_dataset=eval_dataset if training_args.do_eval else None,
+                tokenizer=tokenizer,
+                data_collator=data_collator,
+                compute_metrics=compute_metrics if training_args.do_eval else None,
+                # preprocess_logits_for_metrics=preprocess_logits_for_metrics if training_args.do_eval else None,
+                # callbacks = [rationalcallback],
+                optimizers=(optimizer, None)
+    
     )
 
     # Training
@@ -484,7 +481,7 @@ def main():
         trainer.save_metrics("train", metrics)
         trainer.save_state()
         if data_args.tb_dir:
-            student.roberta.close_tb_writer()
+            model.roberta.close_tb_writer()
 
     # Evaluation
     if training_args.do_eval:

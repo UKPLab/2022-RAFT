@@ -25,6 +25,28 @@ from transformers_modified.integrations import (  # isort: split
     run_hp_search_sigopt,
 )
 
+
+from transformers_modified.trainer_pt_utils import (
+    DistributedLengthGroupedSampler,
+    DistributedSamplerWithLoop,
+    DistributedTensorGatherer,
+    IterableDatasetShard,
+    LabelSmoother,
+    LengthGroupedSampler,
+    SequentialDistributedSampler,
+    ShardSampler,
+    distributed_broadcast_scalars,
+    distributed_concat,
+    find_batch_size,
+    get_parameter_names,
+    nested_concat,
+    nested_detach,
+    nested_numpify,
+    nested_truncate,
+    nested_xla_mesh_reduce,
+    reissue_pt_warnings,
+)
+
 import numpy as np
 import torch
 from packaging import version
@@ -86,7 +108,7 @@ from transformers_modified.trainer_utils import (
 )
 from transformers_modified.training_args import OptimizerNames, ParallelMode, TrainingArguments
 from transformers_modified.utils import logging
-from transformers_modified.trainer import Trainer
+from transformers_modified.trainer import Trainer, logger
 from args import KD_Arguments
 if TYPE_CHECKING:
     import optuna
@@ -113,7 +135,7 @@ OPTIMIZER_NAME = "optimizer.pt"
 SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
 
-logger = logging.get_logger(__name__)
+# logger = logging.get_logger(__name__)
 
 class CustomTrainer(Trainer):
     def __init__(self,
@@ -152,7 +174,7 @@ class CustomTrainer(Trainer):
         self,
         resume_from_checkpoint: Optional[Union[str, bool]] = None,
         trial: Union["optuna.Trial", Dict[str, Any]] = None,
-        ignore_keys_for_eval: Optional[List[str]] = None,
+        ignore_keys_for_eval: Optional[List[str]] = ["hidden_states"],
         **kwargs,
     ):
         """
@@ -312,7 +334,6 @@ class CustomTrainer(Trainer):
             self.model.gradient_checkpointing_enable()
 
         model = self._wrap_model(self.model_wrapped)
-        teacher = self._wrap_model(self.teacher)
 
         # for the rest of this function `model` is the outside model, whether it was wrapped or not
         if model is not self.model:
@@ -454,9 +475,9 @@ class CustomTrainer(Trainer):
                 ):
                     # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
                     with model.no_sync():
-                        tr_loss_step = self.training_step(model, teacher, inputs)
+                        tr_loss_step = self.training_step(model, self.teacher, inputs)
                 else:
-                    tr_loss_step = self.training_step(model, teacher, inputs)
+                    tr_loss_step = self.training_step(model, self.teacher, inputs)
 
                 if (
                     args.logging_nan_inf_filter
@@ -684,58 +705,59 @@ class CustomTrainer(Trainer):
 
     def compute_loss(self, student, teacher, inputs, return_outputs=False):
         student_outputs = student(**inputs, output_hidden_states=True)
-        # with torch.no_grad():
-        #     teacher_outputs = teacher(**inputs, output_hidden_states=True)
-        # s_logits, s_hidden_states = student_outputs["logits"], student_outputs["hidden_states"]
-        # t_logits, t_hidden_states = teacher_outputs["logits"], teacher_outputs["hidden_states"]
-        # assert s_logits.size() == t_logits.size()
+        with torch.no_grad():
+            teacher_outputs = teacher(**inputs, output_hidden_states=True)
+        s_logits, s_hidden_states = student_outputs["logits"], student_outputs["hidden_states"]
+        t_logits, t_hidden_states = teacher_outputs["logits"], teacher_outputs["hidden_states"]
+        assert s_logits.size() == t_logits.size()
 
         loss = student_outputs["loss"]* self.kd_args.alpha_mlm
-        # attention_mask = inputs['attention_mask']
-        # mask = attention_mask.unsqueeze(-1).expand_as(s_logits)
-        # s_logits_slct = torch.masked_select(s_logits, mask.bool())  #(bs*seq*voc_size)
-        # s_logits_slct = s_logits_slct.view(-1, s_logits.size(-1)) #(bs*seq,voc)
-        # t_logits_slct = torch.masked_select(t_logits, mask.bool())
-        # t_logits_slct = t_logits_slct.view(-1, s_logits.size(-1))        
-        # assert t_logits_slct.size() == s_logits_slct.size()
-        # loss_ce = (
-        #     self.ce_loss_fct(
-        #         nn.functional.log_softmax(s_logits_slct / self.kd_args.temperature, dim=-1),
-        #         nn.functional.softmax(t_logits_slct/self.kd_args.temperature, dim=-1)
-        #     )
-        #     *(self.kd_args.temperature) **2
-        # )
-        # loss += self.kd_args.alpha_ce*loss_ce
+        if self.kd_args.alpha_ce > 0.0:
+            attention_mask = inputs['attention_mask']
+            mask = attention_mask.unsqueeze(-1).expand_as(s_logits)
+            s_logits_slct = torch.masked_select(s_logits, mask.bool())  #(bs*seq*voc_size)
+            s_logits_slct = s_logits_slct.view(-1, s_logits.size(-1)) #(bs*seq,voc)
+            t_logits_slct = torch.masked_select(t_logits, mask.bool())
+            t_logits_slct = t_logits_slct.view(-1, s_logits.size(-1))        
+            assert t_logits_slct.size() == s_logits_slct.size()
+            loss_ce = (
+                self.ce_loss_fct(
+                    nn.functional.log_softmax(s_logits_slct / self.kd_args.temperature, dim=-1),
+                    nn.functional.softmax(t_logits_slct/self.kd_args.temperature, dim=-1)
+                )
+                *(self.kd_args.temperature) **2
+            )
+            loss += self.kd_args.alpha_ce*loss_ce
 
-        # # if self.alpha_mlm > 0.0:
-        # #     loss_mlm = self.lm_loss_fct(s_logits.view(-1, s_logits.size(-1)), inputs["labels"].view(-1))
-        # #     loss += self.alpha_mlm * loss_mlm
-        # if self.kd_args.alpha_clm > 0.0:
-        #     shift_logits = s_logits[..., :-1, :].contiguous()
-        #     shift_labels = inputs["labels"][..., 1:].contiguous()
-        #     loss_clm = self.lm_loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        #     loss += self.kd_args.alpha_clm * loss_clm
+        # if self.alpha_mlm > 0.0:
+        #     loss_mlm = self.lm_loss_fct(s_logits.view(-1, s_logits.size(-1)), inputs["labels"].view(-1))
+        #     loss += self.alpha_mlm * loss_mlm
+        if self.kd_args.alpha_clm > 0.0:
+            shift_logits = s_logits[..., :-1, :].contiguous()
+            shift_labels = inputs["labels"][..., 1:].contiguous()
+            loss_clm = self.lm_loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss += self.kd_args.alpha_clm * loss_clm
 
-        # if self.kd_args.alpha_mse > 0.0:
-        #     loss_mse = self.mse_loss_fct(s_logits_slct, t_logits_slct) / s_logits_slct.size(
-        #         0
-        #     )  # Reproducing batchmean reduction
-        #     loss += self.kd_args.alpha_mse * loss_mse
-        # if self.kd_args.alpha_cos > 0.0:
-        #     s_hidden_states = s_hidden_states[-1]  # (bs, seq_length, dim)
-        #     t_hidden_states = t_hidden_states[-1]  # (bs, seq_length, dim)
-        #     mask = attention_mask.unsqueeze(-1).expand_as(s_hidden_states)  # (bs, seq_length, dim)
-        #     assert s_hidden_states.size() == t_hidden_states.size()
-        #     dim = s_hidden_states.size(-1)
+        if self.kd_args.alpha_mse > 0.0:
+            loss_mse = self.mse_loss_fct(s_logits_slct, t_logits_slct) / s_logits_slct.size(
+                0
+            )  # Reproducing batchmean reduction
+            loss += self.kd_args.alpha_mse * loss_mse
+        if self.kd_args.alpha_cos > 0.0:
+            s_hidden_states = s_hidden_states[-1]  # (bs, seq_length, dim)
+            t_hidden_states = t_hidden_states[-1]  # (bs, seq_length, dim)
+            mask = attention_mask.unsqueeze(-1).expand_as(s_hidden_states)  # (bs, seq_length, dim)
+            assert s_hidden_states.size() == t_hidden_states.size()
+            dim = s_hidden_states.size(-1)
 
-        #     s_hidden_states_slct = torch.masked_select(s_hidden_states, mask.bool())  # (bs * seq_length * dim)
-        #     s_hidden_states_slct = s_hidden_states_slct.view(-1, dim)  # (bs * seq_length, dim)
-        #     t_hidden_states_slct = torch.masked_select(t_hidden_states, mask.bool())  # (bs * seq_length * dim)
-        #     t_hidden_states_slct = t_hidden_states_slct.view(-1, dim)  # (bs * seq_length, dim)
+            s_hidden_states_slct = torch.masked_select(s_hidden_states, mask.bool())  # (bs * seq_length * dim)
+            s_hidden_states_slct = s_hidden_states_slct.view(-1, dim)  # (bs * seq_length, dim)
+            t_hidden_states_slct = torch.masked_select(t_hidden_states, mask.bool())  # (bs * seq_length * dim)
+            t_hidden_states_slct = t_hidden_states_slct.view(-1, dim)  # (bs * seq_length, dim)
 
-        #     target = s_hidden_states_slct.new(s_hidden_states_slct.size(0)).fill_(1)  # (bs * seq_length,)
-        #     loss_cos = self.cosine_loss_fct(s_hidden_states_slct, t_hidden_states_slct, target)
-        #     loss += self.kd_args.alpha_cos * loss_cos
+            target = s_hidden_states_slct.new(s_hidden_states_slct.size(0)).fill_(1)  # (bs * seq_length,)
+            loss_cos = self.cosine_loss_fct(s_hidden_states_slct, t_hidden_states_slct, target)
+            loss += self.kd_args.alpha_cos * loss_cos
 
         # self.total_loss_epoch += loss.item()
         # self.last_loss = loss.item()
@@ -749,3 +771,278 @@ class CustomTrainer(Trainer):
         # if self.alpha_cos > 0.0:
         #     self.last_loss_cos = loss_cos.item()
         return (loss, student_outputs) if return_outputs else loss
+
+    def evaluation_loop(
+        self,
+        dataloader: DataLoader,
+        description: str,
+        prediction_loss_only: Optional[bool] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> EvalLoopOutput:
+        """
+        Prediction/evaluation loop, shared by `Trainer.evaluate()` and `Trainer.predict()`.
+
+        Works both with or without labels.
+        """
+        args = self.args
+
+        prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
+
+        # if eval is called w/o train init deepspeed here
+        if args.deepspeed and not self.deepspeed:
+
+            # XXX: eval doesn't have `resume_from_checkpoint` arg but we should be able to do eval
+            # from the checkpoint eventually
+            deepspeed_engine, _, _ = deepspeed_init(
+                self, num_training_steps=0, resume_from_checkpoint=None, inference=True
+            )
+            self.model = deepspeed_engine.module
+            self.model_wrapped = deepspeed_engine
+            self.deepspeed = deepspeed_engine
+
+        model = self._wrap_model(self.model, training=False)
+        # teacher = self._wrap_model(self.teacher, training=False)
+
+        # if full fp16 or bf16 eval is wanted and this ``evaluation`` or ``predict`` isn't called
+        # while ``train`` is running, cast it to the right dtype first and then put on device
+        if not self.is_in_train:
+            if args.fp16_full_eval:
+                model = model.to(dtype=torch.float16, device=args.device)
+            elif args.bf16_full_eval:
+                model = model.to(dtype=torch.bfloat16, device=args.device)
+
+        batch_size = dataloader.batch_size
+
+        logger.info(f"***** Running {description} *****")
+        if isinstance(dataloader.dataset, collections.abc.Sized):
+            logger.info(f"  Num examples = {self.num_examples(dataloader)}")
+        else:
+            logger.info("  Num examples: Unknown")
+        logger.info(f"  Batch size = {batch_size}")
+
+        model.eval()
+
+        self.callback_handler.eval_dataloader = dataloader
+        # Do this before wrapping.
+        eval_dataset = dataloader.dataset
+
+        if is_torch_tpu_available():
+            dataloader = pl.ParallelLoader(dataloader, [args.device]).per_device_loader(args.device)
+
+        if args.past_index >= 0:
+            self._past = None
+
+        # Initialize containers
+        # losses/preds/labels on GPU/TPU (accumulated for eval_accumulation_steps)
+        losses_host = None
+        preds_host = None
+        labels_host = None
+        # losses/preds/labels on CPU (final containers)
+        all_losses = None
+        all_preds = None
+        all_labels = None
+        # Will be useful when we have an iterable dataset so don't know its length.
+
+        observed_num_examples = 0
+        # Main evaluation loop
+        for step, inputs in enumerate(dataloader):
+            # Update the observed num examples
+            observed_batch_size = find_batch_size(inputs)
+            if observed_batch_size is not None:
+                observed_num_examples += observed_batch_size
+                # For batch samplers, batch_size is not known by the dataloader in advance.
+                if batch_size is None:
+                    batch_size = observed_batch_size
+
+            # Prediction step
+            loss, logits, labels = self.prediction_step(model, self.teacher, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+            # select argmax
+            if len(logits.size()) == 3:
+                logits = torch.argmax(logits, axis = -1)
+            if is_torch_tpu_available():
+                xm.mark_step()
+
+            # Update containers on host
+            if loss is not None:
+                losses = self._nested_gather(loss.repeat(batch_size))
+                losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
+            if logits is not None:
+                logits = self._pad_across_processes(logits)
+                logits = self._nested_gather(logits)
+                preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
+
+
+            if labels is not None:
+                labels = self._pad_across_processes(labels)
+                labels = self._nested_gather(labels)
+                labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
+            self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
+
+            # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
+            if args.eval_accumulation_steps is not None and (step + 1) % args.eval_accumulation_steps == 0:
+                if losses_host is not None:
+                    losses = nested_numpify(losses_host)
+                    all_losses = losses if all_losses is None else np.concatenate((all_losses, losses), axis=0)
+                if preds_host is not None:
+                    logits = nested_numpify(preds_host)
+                    all_preds = logits if all_preds is None else nested_concat(all_preds, logits, padding_index=-100)
+                if labels_host is not None:
+                    labels = nested_numpify(labels_host)
+                    all_labels = (
+                        labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
+                    )
+
+                # Set back to None to begin a new accumulation
+                losses_host, preds_host, labels_host = None, None, None
+
+        if args.past_index and hasattr(self, "_past"):
+            # Clean the state at the end of the evaluation loop
+            delattr(self, "_past")
+
+        # Gather all remaining tensors and put them back on the CPU
+        if losses_host is not None:
+            losses = nested_numpify(losses_host)
+            all_losses = losses if all_losses is None else np.concatenate((all_losses, losses), axis=0)
+        if preds_host is not None:
+            logits = nested_numpify(preds_host)
+            all_preds = logits if all_preds is None else nested_concat(all_preds, logits, padding_index=-100)
+            
+        if labels_host is not None:
+            labels = nested_numpify(labels_host)
+            all_labels = labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
+
+        # Number of samples
+        if not isinstance(eval_dataset, IterableDataset):
+            num_samples = len(eval_dataset)
+        # The instance check is weird and does not actually check for the type, but whether the dataset has the right
+        # methods. Therefore we need to make sure it also has the attribute.
+        elif isinstance(eval_dataset, IterableDatasetShard) and hasattr(eval_dataset, "num_examples"):
+            num_samples = eval_dataset.num_examples
+        else:
+            num_samples = observed_num_examples
+
+        # Number of losses has been rounded to a multiple of batch_size and in a distributed training, the number of
+        # samplers has been rounded to a multiple of batch_size, so we truncate.
+        if all_losses is not None:
+            all_losses = all_losses[:num_samples]
+        if all_preds is not None:
+            all_preds = nested_truncate(all_preds, num_samples)
+        if all_labels is not None:
+            all_labels = nested_truncate(all_labels, num_samples)
+
+        # Metrics!
+        if self.compute_metrics is not None and all_preds is not None and all_labels is not None:
+            metrics = self.compute_metrics(EvalPrediction(predictions=all_preds, label_ids=all_labels))
+        else:
+            metrics = {}
+
+        # To be JSON-serializable, we need to remove numpy types or zero-d tensors
+        metrics = denumpify_detensorize(metrics)
+
+        if all_losses is not None:
+            metrics[f"{metric_key_prefix}_loss"] = all_losses.mean().item()
+
+        # Prefix all keys with metric_key_prefix + '_'
+        for key in list(metrics.keys()):
+            if not key.startswith(f"{metric_key_prefix}_"):
+                metrics[f"{metric_key_prefix}_{key}"] = metrics.pop(key)
+
+        return EvalLoopOutput(predictions=all_preds, label_ids=all_labels, metrics=metrics, num_samples=num_samples)
+
+    def prediction_step(
+        self,
+        model: nn.Module,
+        teacher: nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Perform an evaluation step on `model` using `inputs`.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (`nn.Module`):
+                The model to evaluate.
+            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument `labels`. Check your model's documentation for all accepted arguments.
+            prediction_loss_only (`bool`):
+                Whether or not to return the loss only.
+            ignore_keys (`Lst[str]`, *optional*):
+                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
+                gathering predictions.
+
+        Return:
+            Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss,
+            logits and labels (each being optional).
+        """
+        has_labels = all(inputs.get(k) is not None for k in self.label_names)
+        inputs = self._prepare_inputs(inputs)
+        if ignore_keys is None:
+            if hasattr(self.model, "config"):
+                ignore_keys = getattr(self.model.config, "keys_to_ignore_at_inference", [])
+            else:
+                ignore_keys = []
+
+        # labels may be popped when computing the loss (label smoothing for instance) so we grab them first.
+        if has_labels:
+            labels = nested_detach(tuple(inputs.get(name) for name in self.label_names))
+            if len(labels) == 1:
+                labels = labels[0]
+        else:
+            labels = None
+
+        with torch.no_grad():
+            if is_sagemaker_mp_enabled():
+                raw_outputs = smp_forward_only(model, inputs)
+                if has_labels:
+                    if isinstance(raw_outputs, dict):
+                        loss_mb = raw_outputs["loss"]
+                        logits_mb = tuple(v for k, v in raw_outputs.items() if k not in ignore_keys + ["loss"])
+                    else:
+                        loss_mb = raw_outputs[0]
+                        logits_mb = raw_outputs[1:]
+
+                    loss = loss_mb.reduce_mean().detach().cpu()
+                    logits = smp_nested_concat(logits_mb)
+                else:
+                    loss = None
+                    if isinstance(raw_outputs, dict):
+                        logits_mb = tuple(v for k, v in raw_outputs.items() if k not in ignore_keys)
+                    else:
+                        logits_mb = raw_outputs
+                    logits = smp_nested_concat(logits_mb)
+            else:
+                if has_labels:
+                    with self.autocast_smart_context_manager():
+                        loss, outputs = self.compute_loss(model, teacher, inputs, return_outputs=True)
+                    loss = loss.mean().detach()
+                    if isinstance(outputs, dict):
+                        logits = tuple(v for k, v in outputs.items() if k not in ignore_keys + ["loss","hidden_states"])
+                    else:
+                        logits = outputs[1:]
+                else:
+                    loss = None
+                    with self.autocast_smart_context_manager():
+                        outputs = model(**inputs)
+                    if isinstance(outputs, dict):
+                        logits = tuple(v for k, v in outputs.items() if k not in ignore_keys)
+                    else:
+                        logits = outputs
+                    # TODO: this needs to be fixed and made cleaner later.
+                    if self.args.past_index >= 0:
+                        self._past = outputs[self.args.past_index - 1]
+
+        if prediction_loss_only:
+            return (loss, None, None)
+
+        logits = nested_detach(logits)
+        if len(logits) == 1:
+            logits = logits[0]
+
+        return (loss, logits, labels)
