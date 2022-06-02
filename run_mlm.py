@@ -20,51 +20,53 @@ https://huggingface.co/models?filter=fill-mask
 """
 # You can also adapt this script on your own masked language modeling task. Pointers for this are left as comments.
 
-
 import logging
 import math
-import os
 import sys
 import random
-
+from argparse import Namespace
 from itertools import chain
-from typing import Optional
 from unicodedata import name
 import datasets
-import wandb
-from rational.torch import Rational
-from datasets import load_dataset, load_metric
+from datasets import Dataset, DatasetDict, load_dataset, load_metric
+from schedules import get_scheduler
+from timeit import default_timer as get_now
 import transformers_modified as transformers
-from transformers_modified import (
-    CONFIG_MAPPING,
-    MODEL_FOR_MASKED_LM_MAPPING,
-    AutoConfig,
-    AutoModelForMaskedLM,
-    AutoTokenizer,
-    DataCollatorForLanguageModeling,
-    HfArgumentParser,
-    Trainer,
-    set_seed,
-    AdamW,
-    EvalPrediction
-)
-from transformers.trainer_utils import get_last_checkpoint
-from transformers.utils import check_min_version
-from transformers.utils.versions import require_version
+from transformers_modified import (CONFIG_MAPPING, MODEL_FOR_MASKED_LM_MAPPING,
+                                   AutoConfig, AutoModelForMaskedLM,
+                                   AutoTokenizer,
+                                   DataCollatorForLanguageModeling,
+                                   HfArgumentParser, Trainer, set_seed, AdamW,
+                                   EvalPrediction)
+
+from transformers_modified.modeling import BertLMHeadModel
+from transformers_modified.trainer_utils import get_last_checkpoint
+from transformers_modified.utils.versions import require_version
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
-from transformers.integrations import INTEGRATION_TO_CALLBACK
+from transformers_modified.integrations import INTEGRATION_TO_CALLBACK
 from callbacks import CustomWandbCallback
-from args import ModelArguments, CustomTrainingArguments, DataTrainingArguments
-
+from args import ModelArguments, CustomTrainingArguments, DataTrainingArguments, DeepspeedArguments, SchedulerArgs
+from customtrainer import CustomTrainer
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 # check_min_version("4.17.0.dev0")
 
-require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
+require_version(
+    "datasets>=1.8.0",
+    "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt"
+)
 
 logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+
+
+def merge_args(arg_list):
+    args = Namespace()
+    for cur_args in arg_list:
+        for key, value in cur_args.__dict__.items():
+            setattr(args, key, value)
+    return args
 
 
 @record
@@ -74,14 +76,38 @@ def main():
     # We now keep distinct sets of args, for a cleaner separation of concerns.
     import os
     # os.environ["NCCL_DEBUG"] = "INFO"
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, CustomTrainingArguments))
+    parser = HfArgumentParser(
+        (ModelArguments, DataTrainingArguments, CustomTrainingArguments,
+         DeepspeedArguments, SchedulerArgs))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.
-        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+        model_args, data_args, training_args, ds_args, schedule_args = parser.parse_json_file(
+            json_file=os.path.abspath(sys.argv[1]))
     else:
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+        model_args, data_args, training_args, ds_args, schedule_args = parser.parse_args_into_dataclasses(
+        )
 
+    args = merge_args([model_args, data_args, training_args, ds_args])
+
+    # def create_ds_config(args):
+    #     """Create a Deepspeed config dictionary"""
+    #     ds_config = {
+    #         "train_batch_size": training_args.train_batch_size,
+    #         "train_micro_batch_size_per_gpu": args.per_device_train_batch_size,
+    #         "steps_per_print": args.logging_steps,
+    #         "gradient_clipping": args.gradient_clipping,
+    #         "wall_clock_breakdown": args.wall_clock_breakdown,
+    #     }
+
+    #     if args.prescale_gradients:
+    #         ds_config.update({"prescale_gradients": args.prescale_gradients})
+
+    #     if args.gradient_predivide_factor is not None:
+    #         ds_config.update({"gradient_predivide_factor": args.gradient_predivide_factor})
+
+    # args.ds_config = create_ds_config(args)
+    args.schedule_args = schedule_args
     # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -93,7 +119,6 @@ def main():
     # tbc = TensorBoardCallback()
     # rationalcallback = RationalEvoGraph(approx_func=training_args.approx_func)
 
-
     log_level = training_args.get_process_log_level()
     logger.setLevel(log_level)
     datasets.utils.logging.set_verbosity(log_level)
@@ -104,20 +129,23 @@ def main():
     # Log on each process the small summary:
     logger.warning(
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+        +
+        f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
     )
     # Set the verbosity to info of the Transformers logger (on main process only):
     logger.info(f"Training/evaluation parameters {training_args}")
 
     # Detecting last checkpoint.
     last_checkpoint = None
-    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
+    if os.path.isdir(
+            training_args.output_dir
+    ) and training_args.do_train and not training_args.overwrite_output_dir:
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
-        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
+        if last_checkpoint is None and len(os.listdir(
+                training_args.output_dir)) > 0:
             raise ValueError(
                 f"Output directory ({training_args.output_dir}) already exists and is not empty. "
-                "Use --overwrite_output_dir to overcome."
-            )
+                "Use --overwrite_output_dir to overcome.")
         elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
             logger.info(
                 f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
@@ -138,9 +166,9 @@ def main():
     # download the dataset.
     if data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(
-            data_args.dataset_name, data_args.dataset_config_name, cache_dir=model_args.cache_dir
-        )
+        raw_datasets = load_dataset(data_args.dataset_name,
+                                    data_args.dataset_config_name,
+                                    cache_dir=model_args.cache_dir)
         if "validation" not in raw_datasets.keys():
             raw_datasets["validation"] = load_dataset(
                 data_args.dataset_name,
@@ -164,7 +192,9 @@ def main():
             extension = data_args.validation_file.split(".")[-1]
         if extension == "txt":
             extension = "text"
-        raw_datasets = load_dataset(extension, data_files=data_files, cache_dir=model_args.cache_dir)
+        raw_datasets = load_dataset(extension,
+                                    data_files=data_files,
+                                    cache_dir=model_args.cache_dir)
 
         # If no validation data is there, validation_split_percentage will be used to divide the dataset.
         if "validation" not in raw_datasets.keys():
@@ -195,33 +225,40 @@ def main():
         "use_auth_token": True if model_args.use_auth_token else None,
     }
     if model_args.config_name:
-        config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
+        # if model_args.academicBERT:
+        #     config = PretrainedConfig.from_pretrained(model_args.config_name)
+        # else:
+        config = AutoConfig.from_pretrained(model_args.config_name,
+                                            **config_kwargs)
+
     elif model_args.model_name_or_path:
-        config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
+        config = AutoConfig.from_pretrained(model_args.model_name_or_path,
+                                            **config_kwargs)
     else:
-        config = CONFIG_MAPPING[model_args.model_type]()
-        logger.warning("You are instantiating a new config instance from scratch.")
+        config = CONFIG_MAPPING[training_args.model_type]()
+        logger.warning(
+            "You are instantiating a new config instance from scratch.")
         if model_args.config_overrides is not None:
             logger.info(f"Overriding config: {model_args.config_overrides}")
             config.update_from_string(model_args.config_overrides)
             logger.info(f"New config: {config}")
-    
+
     replaced_layers = model_args.rational_layers.split(',')
     rational_layers = []
     for layer in replaced_layers:
         if '-' in layer:
             layers = layer.split('-')
-            rational_layers.extend([str(i) for i in range(int(layers[0]), int(layers[1])+1)])
+            rational_layers.extend(
+                [str(i) for i in range(int(layers[0]),
+                                       int(layers[1]) + 1)])
         else:
             rational_layers.append(layer)
     print("rational_layers", rational_layers)
 
     config.rational_layers = rational_layers
     config.approx_func = training_args.approx_func
-    config.add_ln = model_args.add_ln
     config.logging_steps = training_args.logging_steps
     config.tb_dir = data_args.tb_dir
-
 
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -230,16 +267,18 @@ def main():
         "use_auth_token": True if model_args.use_auth_token else None,
     }
     if model_args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, **tokenizer_kwargs)
+        tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name,
+                                                  **tokenizer_kwargs)
     elif model_args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.model_name_or_path, **tokenizer_kwargs)
     else:
         raise ValueError(
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
-    if not training_args.do_mix and model_args.model_name_or_path:
+    if not training_args.do_mix and model_args.model_name_or_path and not model_args.academicBERT:
         model = AutoModelForMaskedLM.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
@@ -248,19 +287,51 @@ def main():
             revision=model_args.model_revision,
             use_auth_token=True if model_args.use_auth_token else None,
         )
+    elif model_args.academicBERT:
+        
+        if model_args.model_name_or_path:
+            logger.info('loading academicBERT from local model')
+            model = BertLMHeadModel.from_pretrained(
+                model_args.model_name_or_path,
+                from_tf=bool(".ckpt" in model_args.model_name_or_path),
+                config=config,
+                args=args,
+                cache_dir=model_args.cache_dir,
+                revision=model_args.model_revision,
+                use_auth_token=True if model_args.use_auth_token else None)
+        else:
+            logger.info('Training academicBERT from scratch')
+            model = BertLMHeadModel(config=config, args=args)
+
+        # import seaborn as sns
+        # import re
+        # import matplotlib.pyplot as plt
+        # fig, axs = plt.subplots(nrows=2, ncols=3)
+        # reg_exp = r"bert\.encoder\.layer\.(6|7|8|9|10|11)\.intermediate\.dense_act\.weight"
+        # reg_exp = re.compile(reg_exp)
+        # ii = 0
+        # for k, v in model.named_parameters():
+        #     res = re.findall(reg_exp, k)
+        #     if res:
+        #         print(res)
+        #         sns.histplot(v.view(-1).detach().cpu().numpy(), binwidth=0.005, binrange=[-0.05,0.05], ax=axs[ii//3, ii%3])
+        #         ii += 1
+
+        # fig.savefig(f'./dist_{training_args.learning_rate}.png')
+        # exit()
+        
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForMaskedLM.from_config(config)
         if training_args.do_mix:
             config.rational_layers = ['']
-            config.add_ln = False
             pretrained_model = AutoModelForMaskedLM.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
+                model_args.model_name_or_path,
+                from_tf=bool(".ckpt" in model_args.model_name_or_path),
+                config=config,
+                cache_dir=model_args.cache_dir,
+                revision=model_args.model_revision,
+                use_auth_token=True if model_args.use_auth_token else None,
             )
             pretrained_weights = pretrained_model.state_dict()
             replaced_layers = model_args.pretrained_layers.split(',')
@@ -268,11 +339,19 @@ def main():
             for layer in replaced_layers:
                 if '-' in layer:
                     layers = layer.split('-')
-                    pretrained_layers.extend(['layer.'+str(i)+'.' for i in range(int(layers[0]), int(layers[1])+1)])
+                    pretrained_layers.extend([
+                        'layer.' + str(i) + '.'
+                        for i in range(int(layers[0]),
+                                       int(layers[1]) + 1)
+                    ])
                 else:
                     pretrained_layers.append(layer)
             pretrained_layers.append('embedding')
-            replaced_weights = {k:v for k, v in pretrained_weights.items() if any(ly in k for ly in pretrained_layers)}
+            replaced_weights = {
+                k: v
+                for k, v in pretrained_weights.items()
+                if any(ly in k for ly in pretrained_layers)
+            }
             for k, v in replaced_weights.items():
                 v.requires_grad = False
             print("replaced weights", replaced_weights.keys())
@@ -283,20 +362,19 @@ def main():
             if training_args.freeze_pl:
                 logger.info("freeze pretrained layers!")
                 for k, v in model.named_parameters():
-                    if k in replaced_weights: 
-                        v.requires_grad=False
+                    if k in replaced_weights:
+                        v.requires_grad = False
 
             # for k, v in model.named_parameters():
             #     if v.requires_grad:
             #         print(k)
 
-            
-
     model.resize_token_embeddings(len(tokenizer))
+    
+
     # for k,v in model.named_parameters():
     #     print(k,v)
     # exit()
-
     # Preprocessing the datasets.
     # First we tokenize all the texts.
     if training_args.do_train:
@@ -319,7 +397,8 @@ def main():
                 f"The max_seq_length passed ({data_args.max_seq_length}) is larger than the maximum length for the"
                 f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
             )
-        max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
+        max_seq_length = min(data_args.max_seq_length,
+                             tokenizer.model_max_length)
 
     if data_args.line_by_line:
         # When using line_by_line, we just tokenize each nonempty line.
@@ -328,7 +407,8 @@ def main():
         def tokenize_function(examples):
             # Remove empty lines
             examples[text_column_name] = [
-                line for line in examples[text_column_name] if len(line) > 0 and not line.isspace()
+                line for line in examples[text_column_name]
+                if len(line) > 0 and not line.isspace()
             ]
             return tokenizer(
                 examples[text_column_name],
@@ -339,7 +419,7 @@ def main():
                 # receives the `special_tokens_mask`.
                 return_special_tokens_mask=True,
             )
-        
+
         with training_args.main_process_first(desc="dataset map tokenization"):
             tokenized_datasets = raw_datasets.map(
                 tokenize_function,
@@ -353,8 +433,18 @@ def main():
         # Otherwise, we tokenize every text, then concatenate them together before splitting them in smaller parts.
         # We use `return_special_tokens_mask=True` because DataCollatorForLanguageModeling (see below) is more
         # efficient when it receives the `special_tokens_mask`.
+
+        # raw_datasets['train']=raw_datasets['train'].select(range(100))
+        # raw_datasets['validation']=raw_datasets['validation'].select(range(100))
         def tokenize_function(examples):
-            return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
+            # return {
+            #     'tokens': [
+            #         tokenizer.tokenize(example)
+            #         for example in examples[text_column_name]
+            #     ]
+            # }
+            return tokenizer(examples[text_column_name], add_special_tokens=False, return_special_tokens_mask=True)
+
         with training_args.main_process_first(desc="dataset map tokenization"):
             tokenized_datasets = raw_datasets.map(
                 tokenize_function,
@@ -363,24 +453,66 @@ def main():
                 remove_columns=column_names,
                 load_from_cache_file=not data_args.overwrite_cache,
                 desc="Running tokenizer on every text in dataset",
+                cache_file_names={k:os.path.join(model_args.cache_dir, args.dataset_name, k+"_" + args.dataset_name +  model_args.tokenizer_name + "_" + str(data_args.max_seq_length) + "_"+ training_args.model_type+'.arrow') for k in raw_datasets}
             )
 
         # Main data processing function that will concatenate all texts from our dataset and generate chunks of
         # max_seq_length.
-        def group_texts(examples):
-            # Concatenate all texts.
+        def group_texts(examples, cls_id, sep_id):
+            truncated_seq_length = max_seq_length - 2
             concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
             total_length = len(concatenated_examples[list(examples.keys())[0]])
             # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
-            # customize this part to your needs.
+            # # customize this part to your needs.
             if total_length >= max_seq_length:
                 total_length = (total_length // max_seq_length) * max_seq_length
-            # Split by chunks of max_len.
-            result = {
-                k: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
-                for k, t in concatenated_examples.items()
-            }
-            return result
+            
+            # # Split by chunks of max_len.
+            res_dic = {}
+            for k, t in concatenated_examples.items():
+                if k =="input_ids":
+                    res_dic["input_ids"] = [[cls_id]+ t[i : i + truncated_seq_length]+[sep_id] for i in range(0, total_length, truncated_seq_length)]
+                
+                elif k == "attention_mask":
+                    res_dic["attention_mask"] = [[1]+ t[i : i + truncated_seq_length]+[1] for i in range(0, total_length, truncated_seq_length)]
+                
+                elif k == "token_type_ids":
+                    res_dic["token_type_ids"] = [[0]+ t[i : i + truncated_seq_length]+[0] for i in range(0, total_length, truncated_seq_length)]
+                
+                elif k == "special_tokens_mask":
+                    res_dic["special_tokens_mask"] = [[1]+ t[i : i + truncated_seq_length]+[1] for i in range(0, total_length, truncated_seq_length)]
+
+            return res_dic
+            # result = {
+            #     k: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
+            #     for k, t in concatenated_examples.items()
+            # }
+            # return result
+
+            
+            # Concatenate all texts.
+            # concatenated_examples = {
+            #     'tokens': list(chain(*examples['tokens']))
+            # }
+            # total_length = len(concatenated_examples['tokens'])
+            # # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
+            # # customize this part to your needs.
+            # if total_length >= truncated_seq_length:
+            #     total_length = (total_length //
+            #                     truncated_seq_length) * truncated_seq_length
+            # # Split by chunks of max_len.
+            # grouped_tokens = {
+            #     'tokens': [
+            #         concatenated_examples["tokens"][i:i + truncated_seq_length]
+            #         for i in range(0, total_length, truncated_seq_length)
+            #     ]
+            # }
+            # return tokenizer(grouped_tokens['tokens'],
+            #                  add_special_tokens=True,
+            #                  padding="max_length",
+            #                  max_length=max_seq_length,
+            #                  is_split_into_words=True,
+            #                  return_special_tokens_mask=True)
 
         # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a
         # remainder for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value
@@ -388,24 +520,31 @@ def main():
         #
         # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
         # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
-
+        if training_args.model_type == "bert":
+            cls_id = tokenizer.convert_tokens_to_ids("[CLS]")
+            sep_id = tokenizer.convert_tokens_to_ids("[SEP]")
+        elif training_args.model_type == "roberta":
+            cls_id = tokenizer.convert_tokens_to_ids("<s>")
+            sep_id = tokenizer.convert_tokens_to_ids("</s>")
         with training_args.main_process_first(desc="grouping texts together"):
             tokenized_datasets = tokenized_datasets.map(
-                group_texts,
+                lambda x :group_texts(x, cls_id=cls_id,sep_id=sep_id),
                 batched=True,
                 num_proc=data_args.preprocessing_num_workers,
                 load_from_cache_file=not data_args.overwrite_cache,
                 desc=f"Grouping texts in chunks of {max_seq_length}",
+                cache_file_names={k:os.path.join(model_args.cache_dir, args.dataset_name, "grouped_" + k +"_" + args.dataset_name +  model_args.tokenizer_name + "_" + str(data_args.max_seq_length) + "_"+ training_args.model_type+'.arrow') for k in raw_datasets}
             )
-
+                            
     if training_args.do_train:
         if "train" not in tokenized_datasets:
             raise ValueError("--do_train requires a train dataset")
         train_dataset = tokenized_datasets["train"]
         print('train size', len(train_dataset))
-        
+
         if data_args.max_train_samples is not None:
-            train_dataset = train_dataset.select(range(data_args.max_train_samples))
+            train_dataset = train_dataset.select(
+                range(data_args.max_train_samples))
             print('selected training samples', len(train_dataset))
 
     if training_args.do_eval:
@@ -414,7 +553,8 @@ def main():
         eval_dataset = tokenized_datasets["validation"]
         print('eval_dataset', len(eval_dataset))
         if data_args.max_eval_samples is not None:
-            eval_dataset = eval_dataset.select(range(data_args.max_eval_samples))
+            eval_dataset = eval_dataset.select(
+                range(data_args.max_eval_samples))
 
         def preprocess_logits_for_metrics(logits, labels):
             return logits.argmax(dim=-1)
@@ -426,10 +566,12 @@ def main():
             # preds have the same shape as the labels, after the argmax(-1) has been calculated
             # by preprocess_logits_for_metrics
             labels = labels.reshape(-1)
-            preds = preds.reshape(-1)
             mask = labels != -100
             labels = labels[mask]
-            preds = preds[mask]
+            # for unsparsed prediction the preds size is [batch_size, seq_length]
+            if len(preds.shape) == 2:
+                preds = preds.reshape(-1)
+                preds = preds[mask]
             return metric.compute(predictions=preds, references=labels)
 
     # Data collator
@@ -440,35 +582,72 @@ def main():
         mlm_probability=data_args.mlm_probability,
         pad_to_multiple_of=8 if pad_to_multiple_of_8 else None,
     )
-        
+
     # set optimizer for rational and others
-    rational = ['numerator','denominator']
-    # no_decay = ["bias", "LayerNorm.weight"]
+    rational = ['numerator', 'denominator']
+    no_decay = ["bias", "LayerNorm.weight"]
     if training_args.do_mix:
         if training_args.freeze_pl:
             grouped_params = [
-                {"params":[v for k, v in model.named_parameters() if any(param in k for param in rational)],
-                "lr": training_args.rational_lr,
-                "weight_decay": training_args.weight_decay},
-                
-                {"params":[v for k, v in model.named_parameters() if any('layer.'+ l +'.' in k for l in rational_layers) and not any(param in k for param in rational)],
-                "lr": training_args.learning_rate,
-                "weight_decay": training_args.weight_decay},
+                {
+                    "params": [
+                        v for k, v in model.named_parameters()
+                        if any(param in k for param in rational)
+                    ],
+                    "lr":
+                    training_args.rational_lr,
+                    "weight_decay":
+                    training_args.weight_decay
+                },
+                {
+                    "params": [
+                        v for k, v in model.named_parameters()
+                        if any('layer.' + l + '.' in k
+                               for l in rational_layers) and not any(
+                                   param in k for param in rational)
+                    ],
+                    "lr":
+                    training_args.learning_rate,
+                    "weight_decay":
+                    training_args.weight_decay
+                },
             ]
 
         else:
             grouped_params = [
-                {"params":[v for k, v in model.named_parameters() if any(param in k for param in rational)],
-                "lr": training_args.rational_lr,
-                "weight_decay": training_args.weight_decay},
+                {
+                    "params": [
+                        v for k, v in model.named_parameters()
+                        if any(param in k for param in rational)
+                    ],
+                    "lr":
+                    training_args.rational_lr,
+                    "weight_decay":
+                    training_args.weight_decay
+                },
                 #random initialised ones
-                {"params":[v for k, v in model.named_parameters() if not any(l in k for l in pretrained_layers) and not any(param in k for param in rational)],
-                "lr": training_args.learning_rate,
-                "weight_decay": training_args.weight_decay},
+                {
+                    "params": [
+                        v for k, v in model.named_parameters()
+                        if not any(l in k
+                                   for l in pretrained_layers) and not any(
+                                       param in k for param in rational)
+                    ],
+                    "lr":
+                    training_args.learning_rate,
+                    "weight_decay":
+                    training_args.weight_decay
+                },
                 # pretrained ones
-                {"params":[v for k, v in model.named_parameters() if any(l in k for l in pretrained_layers)],
-                "lr":  training_args.pl_learning_rate,
-                "weight_decay": training_args.weight_decay
+                {
+                    "params": [
+                        v for k, v in model.named_parameters()
+                        if any(l in k for l in pretrained_layers)
+                    ],
+                    "lr":
+                    training_args.pl_learning_rate,
+                    "weight_decay":
+                    training_args.weight_decay
                 }
             ]
             # a = [k for k, v in model.named_parameters() if any(param in k for param in rational)]
@@ -478,28 +657,56 @@ def main():
             # c = [k for k, v in model.named_parameters() if any (l in k for l in pretrained_layers)]
 
     else:
-        grouped_params = [
-            {"params":[v for k, v in model.named_parameters() if any(param in k for param in rational)],
-            "lr": training_args.rational_lr,
-            "weight_decay": training_args.weight_decay},
-
-            {"params":[v for k, v in model.named_parameters() if not any(param in k for param in rational)],
-            "lr": training_args.learning_rate,
-            "weight_decay": training_args.weight_decay},
-
-            # {"params": [v for k, v in model.named_parameters() if not any(param in k for param in rational) and any(param in k for param in no_decay)],
-            # "lr": training_args.learning_rate,
-            # "weight_decay": 0.0}
-            ]
-
-    # optimizer = AdamW(grouped_params, lr=training_args.learning_rate, weight_decay=training_args.weight_decay)
-    optimizer = torch.optim.Adam(
-            grouped_params, lr=training_args.learning_rate, weight_decay=training_args.weight_decay
-        )
+        grouped_params = [{
+            "params": [
+                v for k, v in model.named_parameters()
+                if any(param in k for param in rational)
+            ],
+            "lr":
+            training_args.rational_lr,
+            "weight_decay":
+            0.0
+        }, {
+            "params": [
+                v for k, v in model.named_parameters()
+                if not any(param in k for param in rational) and not any(
+                    param in k for param in no_decay)
+            ],
+            "lr":
+            training_args.learning_rate,
+            "weight_decay":
+            training_args.weight_decay
+        }, {
+            "params": [
+                v for k, v in model.named_parameters()
+                if not any(param in k for param in rational) and any(
+                    param in k for param in no_decay)
+            ],
+            "lr":
+            training_args.learning_rate,
+            "weight_decay":
+            0.0
+        }]
+    if args.optimizer == "adam":
+        optimizer = torch.optim.Adam(grouped_params,
+                                     lr=training_args.learning_rate,
+                                     weight_decay=training_args.weight_decay)
+    elif args.optimizer == "adamw":
+        # args.exp_start_marker = get_now()
+        optimizer = AdamW(grouped_params,
+                          lr=training_args.learning_rate,
+                          weight_decay=training_args.weight_decay,
+                          betas=(args.adam_beta1, args.adam_beta2),
+                          eps=args.adam_epsilon)
+    if model_args.academicBERT:
+        scheduler = get_scheduler(args.schedule_args, optimizer, args)
+    else:
+        scheduler = None
+    training_args.warmup_proportion_list = schedule_args.warmup_proportion_list
 
 
     # Initialize our Trainer
-    trainer = Trainer(
+    trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
@@ -509,14 +716,15 @@ def main():
         compute_metrics=compute_metrics if training_args.do_eval else None,
         # preprocess_logits_for_metrics=preprocess_logits_for_metrics if training_args.do_eval else None,
         # callbacks = [rationalcallback],
-        optimizers=(optimizer, None)
-    )
+        optimizers=(optimizer, scheduler))
 
     # Training
     if training_args.do_train:
-        # for index in random.sample(range(len(train_dataset)), 3):
-        #     logger.info(
-        #         f"Sample {index} of the training set: {train_dataset[index]}.")
+        
+        for index in random.sample(range(len(train_dataset)), 3):
+            logger.info(
+                f"Sample {index} of the training set: {train_dataset[index]}.")
+            assert len(train_dataset[index]['input_ids']) == len(train_dataset[index]['attention_mask']) == len(train_dataset[index]['token_type_ids']) == len(train_dataset[index]['special_tokens_mask'])
         checkpoint = None
         if training_args.resume_from_checkpoint is not None:
             checkpoint = training_args.resume_from_checkpoint
@@ -527,9 +735,9 @@ def main():
         trainer.save_model()  # Saves the tokenizer too for easy upload
         metrics = train_result.metrics
 
-        max_train_samples = (
-            data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
-        )
+        max_train_samples = (data_args.max_train_samples
+                             if data_args.max_train_samples is not None else
+                             len(train_dataset))
         metrics["train_samples"] = min(max_train_samples, len(train_dataset))
 
         trainer.log_metrics("train", metrics)
@@ -544,7 +752,8 @@ def main():
 
         metrics = trainer.evaluate()
 
-        max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
+        max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(
+            eval_dataset)
         metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
         try:
             perplexity = math.exp(metrics["eval_loss"])
@@ -555,12 +764,16 @@ def main():
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
-    kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "fill-mask"}
+    kwargs = {
+        "finetuned_from": model_args.model_name_or_path,
+        "tasks": "fill-mask"
+    }
     if data_args.dataset_name is not None:
         kwargs["dataset_tags"] = data_args.dataset_name
         if data_args.dataset_config_name is not None:
             kwargs["dataset_args"] = data_args.dataset_config_name
-            kwargs["dataset"] = f"{data_args.dataset_name} {data_args.dataset_config_name}"
+            kwargs[
+                "dataset"] = f"{data_args.dataset_name} {data_args.dataset_config_name}"
         else:
             kwargs["dataset"] = data_args.dataset_name
 

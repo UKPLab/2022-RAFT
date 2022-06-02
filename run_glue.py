@@ -61,6 +61,7 @@ from pruning_utils import parameters_to_prune, original_params
 import torch.nn.utils.prune as prune
 from transformers_modified.trainer_utils import PREFIX_CHECKPOINT_DIR, HPSearchBackend
 from RecAdam import RecAdam, anneal_function
+from transformers_modified.modeling import BertForSequenceClassification
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 # check_min_version("4.18.0.dev0")
@@ -84,135 +85,6 @@ task_to_keys = {
 
 logger = logging.getLogger(__name__)
 
-# @dataclass
-# class DataTrainingArguments:
-#     """
-#     Arguments pertaining to what data we are going to input our model for training and eval.
-#     Using `HfArgumentParser` we can turn this class
-#     into argparse arguments to be able to specify them on
-#     the command line.
-#     """
-
-#     task_name: Optional[str] = field(
-#         default=None,
-#         metadata={"help": "The name of the task to train on: " + ", ".join(task_to_keys.keys())},
-#     )
-#     dataset_name: Optional[str] = field(
-#         default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
-#     )
-#     dataset_config_name: Optional[str] = field(
-#         default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
-#     )
-#     max_seq_length: int = field(
-#         default=128,
-#         metadata={
-#             "help": "The maximum total input sequence length after tokenization. Sequences longer "
-#             "than this will be truncated, sequences shorter will be padded."
-#         },
-#     )
-#     overwrite_cache: bool = field(
-#         default=False, metadata={"help": "Overwrite the cached preprocessed datasets or not."}
-#     )
-#     pad_to_max_length: bool = field(
-#         default=True,
-#         metadata={
-#             "help": "Whether to pad all samples to `max_seq_length`. "
-#             "If False, will pad the samples dynamically when batching to the maximum length in the batch."
-#         },
-#     )
-#     max_train_samples: Optional[int] = field(
-#         default=None,
-#         metadata={
-#             "help": "For debugging purposes or quicker training, truncate the number of training examples to this "
-#             "value if set."
-#         },
-#     )
-#     max_eval_samples: Optional[int] = field(
-#         default=None,
-#         metadata={
-#             "help": "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
-#             "value if set."
-#         },
-#     )
-#     max_predict_samples: Optional[int] = field(
-#         default=None,
-#         metadata={
-#             "help": "For debugging purposes or quicker training, truncate the number of prediction examples to this "
-#             "value if set."
-#         },
-#     )
-#     train_file: Optional[str] = field(
-#         default=None, metadata={"help": "A csv or a json file containing the training data."}
-#     )
-#     validation_file: Optional[str] = field(
-#         default=None, metadata={"help": "A csv or a json file containing the validation data."}
-#     )
-#     test_file: Optional[str] = field(default=None, metadata={"help": "A csv or a json file containing the test data."})
-
-#     def __post_init__(self):
-#         if self.task_name is not None:
-#             self.task_name = self.task_name.lower()
-#             if self.task_name not in task_to_keys.keys():
-#                 raise ValueError("Unknown task, you should pick one in " + ",".join(task_to_keys.keys()))
-#         elif self.dataset_name is not None:
-#             pass
-#         elif self.train_file is None or self.validation_file is None:
-#             raise ValueError("Need either a GLUE task, a training/validation file or a dataset name.")
-#         else:
-#             train_extension = self.train_file.split(".")[-1]
-#             assert train_extension in ["csv", "json"], "`train_file` should be a csv or a json file."
-#             validation_extension = self.validation_file.split(".")[-1]
-#             assert (
-#                 validation_extension == train_extension
-#             ), "`validation_file` should have the same extension (csv or json) as `train_file`."
-
-# @dataclass
-# class ModelArguments:
-#     """
-#     Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
-#     """
-
-#     model_name_or_path: str = field(
-#         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
-#     )
-#     config_name: Optional[str] = field(
-#         default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
-#     )
-#     tokenizer_name: Optional[str] = field(
-#         default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
-#     )
-#     cache_dir: Optional[str] = field(
-#         default=None,
-#         metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
-#     )
-#     use_fast_tokenizer: bool = field(
-#         default=True,
-#         metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
-#     )
-#     model_revision: str = field(
-#         default="main",
-#         metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
-#     )
-#     use_auth_token: bool = field(
-#         default=False,
-#         metadata={
-#             "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
-#             "with private models)."
-#         },
-#     )
-# @dataclass
-# class CustomTrainingArguments(TrainingArguments):
-#     approx_func:Optional[str] = field(
-#         default="gelu", metadata={"help": "specify which layer to use rationals, 0-11 means all layers"})
-
-#     save_rational_plots: bool = False
-
-#     run_name: str = field(
-#         default="run1",
-#         metadata={
-#             "help": "wandb run name"
-#         }
-#     )
 
 
 class CustomTrainer(Trainer):
@@ -274,7 +146,7 @@ class CustomTrainer(Trainer):
             self._save_checkpoint(model, trial, metrics=metrics)
             self.control = self.callback_handler.on_save(
                 self.args, self.state, self.control)
-            if self.args.do_pruning:
+            if self.args.do_pruning and (epoch+1)%3 == 0:
                 logger.info('start pruning...')
 
                 logger.info(f'pruning {self.pruning_step+1}0%')
@@ -357,6 +229,8 @@ class CustomTrainer(Trainer):
 
         if "labels" in inputs:
             preds = outputs.logits.detach()
+            # print('preds',preds)
+            # print('labels', inputs['labels'])
             acc = ((preds.argmax(axis=-1) == inputs["labels"]).type(
                 torch.float).mean().item())
             if self.state.global_step % self.args.logging_steps == 0 and not self.control.should_evaluate:
@@ -505,6 +379,35 @@ def main():
         else:
             num_labels = 1
     else:
+        pass
+        # for mlm pruning
+        # column_names = raw_datasets["validation"].column_names
+        # text_column_name = "text" if "text" in column_names else column_names[0]
+
+        # with training_args.main_process_first(desc="dataset map tokenization"):
+        #     tokenized_datasets = raw_datasets.map(
+        #         tokenize_function,
+        #         batched=True,
+        #         num_proc=data_args.preprocessing_num_workers,
+        #         remove_columns=column_names,
+        #         load_from_cache_file=not data_args.overwrite_cache,
+        #         desc="Running tokenizer on every text in dataset",
+        #         cache_file_names={k:os.path.join(model_args.cache_dir, data_args.dataset_name, k+"_" + data_args.dataset_name +  model_args.tokenizer_name + "_" + str(data_args.max_seq_length) + "_"+ training_args.model_type+'.arrow') for k in raw_datasets}
+        #     )
+        
+        # cls_id = tokenizer.convert_tokens_to_ids("[CLS]")
+        # sep_id = tokenizer.convert_tokens_to_ids("[SEP]")
+        # with training_args.main_process_first(desc="grouping texts together"):
+        #     tokenized_datasets = tokenized_datasets.map(
+        #         lambda x :group_texts(x, cls_id=cls_id,sep_id=sep_id),
+        #         batched=True,
+        #         num_proc=data_args.preprocessing_num_workers,
+        #         load_from_cache_file=not data_args.overwrite_cache,
+        #         desc=f"Grouping texts in chunks of {max_seq_length}",
+        #         cache_file_names={k:os.path.join(model_args.cache_dir, data_args.dataset_name, "grouped_" + k +"_" + args.dataset_name +  model_args.tokenizer_name + "_" + str(data_args.max_seq_length) + "_"+ training_args.model_type+'.arrow') for k in raw_datasets}
+        #     )
+        #     eval_dataset = tokenized_datasets["validation"]
+        
         # Trying to have good defaults here, don't hesitate to tweak to your needs.
         is_regression = raw_datasets["train"].features["label"].dtype in [
             "float32", "float64"
@@ -516,7 +419,9 @@ def main():
             # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.unique
             label_list = raw_datasets["train"].unique("label")
             label_list.sort()  # Let's sort it for determinism
+            label_list.remove(-1)
             num_labels = len(label_list)
+            print("label list", label_list)
 
     # Load pretrained model and tokenizer
     #
@@ -590,6 +495,14 @@ def main():
             model.load_state_dict(model_dict)
             # add rational for random initialised model
 
+    elif model_args.academicBERT:
+        model = BertForSequenceClassification.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            config=config,
+            cache_dir=model_args.cache_dir,
+        )
+       
     else:
         model = AutoModelForSequenceClassification.from_pretrained(
             model_args.model_name_or_path,
@@ -628,8 +541,7 @@ def main():
             ],
             "lr":
             training_args.rational_lr,
-            "weight_decay":
-            training_args.weight_decay
+            "weight_decay":0.0
         }, {
             "params": [
                 v for k, v in model.named_parameters()
@@ -877,8 +789,15 @@ def main():
 
         if "validation" not in raw_datasets and "validation_matched" not in raw_datasets:
             raise ValueError("--do_eval requires a validation dataset")
-        predict_dataset = raw_datasets["validation_matched" if data_args.
-                                       task_name == "mnli" else "validation"]
+        if training_args.zero_shot:
+            predict_dataset = raw_datasets["test"]
+            predict_dataset.remove_columns(['premise', 'hypothesis'])
+            predict_dataset = predict_dataset.filter(lambda example: example['label']!=-1)
+            
+        else:
+            predict_dataset = raw_datasets["validation_matched" if data_args.
+                                        task_name == "mnli" else "validation"]
+
         if data_args.max_eval_samples is not None:
             predict_dataset = predict_dataset.select(
                 range(data_args.max_eval_samples))
@@ -932,7 +851,7 @@ def main():
     else:
         data_collator = None
     if training_args.do_pruning:
-        origin_weights = original_params(model)
+        origin_weights = original_params(model, training_args.model_type)
         callback = None
     else:
         origin_weights = None
@@ -948,7 +867,7 @@ def main():
         data_collator=data_collator,
         optimizers=(optimizer, None),
         origin_params=origin_weights,
-        callbacks=None)
+        callbacks=[callback])
     # trainer = Trainer(
     #     model=model,
     #     args=training_args,

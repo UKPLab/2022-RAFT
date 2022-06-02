@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from optparse import Option
-from typing import Optional
-
+from typing import Optional, List
+import os
 from torch import OptionalType
 from transformers_modified import TrainingArguments
 
@@ -57,7 +57,9 @@ class ModelArguments:
             "with private models)."
         },
     )
-
+    academicBERT: bool = field(
+        default=False
+    )
     pretrained_layers: Optional[str] = field(
         default="", 
         metadata={"help": "loaded from pretrained layers"}
@@ -76,15 +78,16 @@ class CustomTrainingArguments(TrainingArguments):
         default="gelu", metadata={"help": "specify which layer to use rationals, 0-11 means all layers"})
 
     save_rational_plots: bool = False
-
+    zero_shot: bool = False
     run_name: str = field(
         default="run1",
         metadata={
             "help": "wandb run name"
         }
     )
-
+    scale_cnt_limit: int = 5
     do_pruning: bool = False
+    sparse_mask_prediction: bool = False
 
     model_type: Optional[str] = field(
         default=None,
@@ -92,6 +95,10 @@ class CustomTrainingArguments(TrainingArguments):
     )
 
     do_mix: bool = False
+
+    total_training_time: Optional[float] = field(
+        default=24.0, metadata={"help": "Max hours for pre-training)"}
+    )
 
     freeze_pl: bool = False
 
@@ -148,7 +155,7 @@ class DataTrainingArguments:
     )
 
     task_name: str = field(
-    default="wikitext-2",
+    default=None,
     metadata={
         "help": "task name to record. "
     },
@@ -230,3 +237,108 @@ class KD_Arguments:
     alpha_clm: Optional[float] = field(default=0.0, metadata={})
     alpha_mse: Optional[float] = field(default=0.0, metadata={})
     temperature: Optional[float] = field(default=2.0, metadata={"help":"Temperature for the softmax temperature"})
+
+
+@dataclass
+class DeepspeedArguments:
+    """
+    DeepspeedArguments
+    """
+
+    _argument_group_name = "Deepspeed Arguments"
+
+    # deepspeed: Optional[bool] = field(default=False, metadata={"help": "Use deepspeed."})
+
+    deepspeed_transformer_kernel: Optional[bool] = field(
+        default=False, metadata={"help": "Use DeepSpeed transformer kernel to accelerate."}
+    )
+
+    stochastic_mode: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Use stochastic mode for high-performance transformer kernel.",
+        },
+    )
+
+    attention_dropout_checkpoint: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Use DeepSpeed transformer kernel memory optimization to checkpoint dropout output.",
+        },
+    )
+
+    normalize_invertible: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Use DeepSpeed transformer kernel memory optimization to perform invertible normalize backpropagation.",
+        },
+    )
+
+    gelu_checkpoint: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Use DeepSpeed transformer kernel memory optimization to checkpoint GELU activation.",
+        },
+    )
+
+    gradient_clipping: Optional[float] = field(
+        default=1.0, metadata={"help": "Gradient clipping (default 1.0)"}
+    )
+
+    steps_per_print: Optional[int] = field(
+        default=100, metadata={"help": "Number of steps between training steps print"}
+    )
+
+    wall_clock_breakdown: Optional[bool] = field(
+        default=False, metadata={"help": "wall clock breakdown"}
+    )
+
+    prescale_gradients: Optional[bool] = field(
+        default=False, metadata={"help": "Scale gradients before doing allreduce"}
+    )
+
+    gradient_predivide_factor: Optional[int] = field(
+        default=None, metadata={"help": "gradient predivide factor"}
+    )
+
+    def __post_init__(self):
+        if self.deepspeed_transformer_kernel:
+            remove_cuda_compatibility_for_kernel_compilation()
+
+
+def remove_cuda_compatibility_for_kernel_compilation():
+    if "TORCH_CUDA_ARCH_LIST" in os.environ:
+        del os.environ["TORCH_CUDA_ARCH_LIST"]
+
+
+
+
+
+@dataclass
+class SchedulerArgs:
+    """
+    Scheduler Arguments
+    """
+
+    _argument_group_name = "Scheduler Arguments"
+
+    lr_schedule: Optional[List[str]] = field(
+        default="time",
+        metadata={
+            "help": "learning rate scheduler type (step/constant_step/time"
+        },
+    )
+
+    curve: Optional[List[str]] = field(
+        default="linear",
+        metadata={
+            "help": "curve shape (linear/exp)",
+        },
+    )
+
+    warmup_proportion_list: Optional[List[float]] = field(default=0.06, metadata={"help": "Warmup proportion"})
+    decay_rate: Optional[float] = field(default=0.99, metadata={"help": "Decay rate"})
+    decay_step: Optional[int] = field(default=1000, metadata={"help": "Decay step"})
+    num_warmup_steps: Optional[int] = field(
+        default=1000, metadata={"help": "Number of warmup steps"}
+    )
