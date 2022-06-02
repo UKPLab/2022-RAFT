@@ -8,7 +8,7 @@ from pruning_utils import parameters_to_prune, get_zero_rate
 import seaborn as sns
 import matplotlib.pyplot as plt
 import os
-
+from transformers_modified.modeling import BertForSequenceClassification
 
 def load_pruned_model(args, task_name, act_func, model, model_dir):
     model_path =os.path.join(model_dir, 'pytorch_model.bin')
@@ -50,14 +50,22 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in model_args.model_name_or_path),
-        config=config,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-    )
+    if model_args.academicBERT:
+        model = BertForSequenceClassification.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            config=config,
+            cache_dir=model_args.cache_dir,
+        )
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
 
     if model_args.rational_layers == "0-11":
         act_func = "rational"
