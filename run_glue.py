@@ -292,7 +292,6 @@ def main():
 
     # Detecting last checkpoint.
     last_checkpoint = None
-    print('here')
     if os.path.isdir(
             training_args.output_dir
     ) and training_args.do_train and not training_args.overwrite_output_dir:
@@ -772,11 +771,11 @@ def main():
     if training_args.do_train:
         if "train" not in raw_datasets:
             raise ValueError("--do_train requires a train dataset")
-        train_dataset = raw_datasets["train"]
-        train_dataset = train_dataset.shuffle(seed=96)
+        train_eval_dataset = raw_datasets["train"]
+        train_eval_dataset = train_eval_dataset.shuffle(seed=96)
   
-        train_nums = int(len(train_dataset) * 0.75)
-        train_dataset = train_dataset.select(range(train_nums))
+        train_nums = int(len(train_eval_dataset) * 0.75)
+        train_dataset = train_eval_dataset.select(range(train_nums))
 
         if data_args.max_train_samples is not None:
             random.seed(training_args.seed)
@@ -785,8 +784,8 @@ def main():
 
     if training_args.do_eval:
         # use 25% training data as validation data
-        eval_dataset = raw_datasets["train"].select(
-                range(train_nums, len(raw_datasets["train"])))
+        eval_dataset = train_eval_dataset.select(
+                range(train_nums, len(train_eval_dataset)))
 
         if data_args.max_eval_samples is not None and data_args.max_eval_samples < len(eval_dataset):
             random.seed(training_args.seed)
