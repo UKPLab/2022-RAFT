@@ -16,7 +16,6 @@
 """ Finetuning the library models for sequence classification on GLUE."""
 # You can also adapt this script on your own text classification task. Pointers for this are left as comments.
 
-import imp
 import logging
 import os
 import random
@@ -26,7 +25,7 @@ import datasets
 import numpy as np
 from datasets import load_dataset, load_metric
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
-
+import random
 import torch
 from torch.utils.data import DataLoader, Dataset
 import transformers_modified as transformers
@@ -54,7 +53,7 @@ from transformers_modified.trainer_utils import get_last_checkpoint
 from transformers_modified import EarlyStoppingCallback
 from transformers_modified.utils import check_min_version
 from transformers_modified.utils.versions import require_version
-from args import ModelArguments, CustomTrainingArguments, DataTrainingArguments
+from args import ModelArguments, CustomTrainingArguments, DataTrainingArguments, SchedulerArgs
 from callbacks import CustomWandbCallback
 from transformers_modified.integrations import INTEGRATION_TO_CALLBACK
 from pruning_utils import parameters_to_prune, original_params
@@ -62,6 +61,7 @@ import torch.nn.utils.prune as prune
 from transformers_modified.trainer_utils import PREFIX_CHECKPOINT_DIR, HPSearchBackend
 from RecAdam import RecAdam, anneal_function
 from transformers_modified.modeling import BertForSequenceClassification
+from schedules import get_scheduler
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 # check_min_version("4.18.0.dev0")
@@ -258,14 +258,14 @@ def main():
     # We now keep distinct sets of args, for a cleaner separation of concerns.
 
     parser = HfArgumentParser(
-        (ModelArguments, DataTrainingArguments, CustomTrainingArguments))
+        (ModelArguments, DataTrainingArguments, CustomTrainingArguments, SchedulerArgs))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.
-        model_args, data_args, training_args = parser.parse_json_file(
+        model_args, data_args, training_args, scheduler_args = parser.parse_json_file(
             json_file=os.path.abspath(sys.argv[1]))
     else:
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses(
+        model_args, data_args, training_args,scheduler_args = parser.parse_args_into_dataclasses(
         )
 
     # Setup logging
@@ -292,6 +292,7 @@ def main():
 
     # Detecting last checkpoint.
     last_checkpoint = None
+    print('here')
     if os.path.isdir(
             training_args.output_dir
     ) and training_args.do_train and not training_args.overwrite_output_dir:
@@ -541,7 +542,7 @@ def main():
             ],
             "lr":
             training_args.rational_lr,
-            "weight_decay":0.0
+            "weight_decay":training_args.weight_decay
         }, {
             "params": [
                 v for k, v in model.named_parameters()
@@ -772,18 +773,29 @@ def main():
         if "train" not in raw_datasets:
             raise ValueError("--do_train requires a train dataset")
         train_dataset = raw_datasets["train"]
+        train_dataset = train_dataset.shuffle(seed=96)
+  
+        train_nums = int(len(train_dataset) * 0.75)
+        train_dataset = train_dataset.select(range(train_nums))
+
         if data_args.max_train_samples is not None:
-            train_nums = int(len(train_dataset) * 0.75)
-            train_dataset = train_dataset.select(range(train_nums))
+            random.seed(training_args.seed)
+            train_ixs = random.sample(range(len(train_dataset['idx'])), data_args.max_train_samples)
+            train_dataset = train_dataset.select(train_ixs)
 
     if training_args.do_eval:
         # use 25% training data as validation data
-        if data_args.max_train_samples is not None:
-            eval_dataset = raw_datasets["train"].select(
+        eval_dataset = raw_datasets["train"].select(
                 range(train_nums, len(raw_datasets["train"])))
-        else:
-            eval_dataset = raw_datasets["validation_matched" if data_args.
-                                        task_name == "mnli" else "validation"]
+
+        if data_args.max_eval_samples is not None and data_args.max_eval_samples < len(eval_dataset):
+            random.seed(training_args.seed)
+            eval_ixs = random.sample(range(len(eval_dataset['idx'])), data_args.max_eval_samples)
+            eval_dataset = eval_dataset.select(eval_ixs)
+
+        # else:
+        #     eval_dataset = raw_datasets["validation_matched" if data_args.
+        #                                 task_name == "mnli" else "validation"]
 
     if training_args.do_predict or data_args.task_name is not None or data_args.test_file is not None:
 
@@ -798,9 +810,9 @@ def main():
             predict_dataset = raw_datasets["validation_matched" if data_args.
                                         task_name == "mnli" else "validation"]
 
-        if data_args.max_eval_samples is not None:
-            predict_dataset = predict_dataset.select(
-                range(data_args.max_eval_samples))
+        # if data_args.max_eval_samples is not None:
+        #     predict_dataset = predict_dataset.select(
+        #         range(data_args.max_eval_samples))
 
         # if "test" not in raw_datasets and "test_matched" not in raw_datasets:
         #     raise ValueError("--do_predict requires a test dataset")
@@ -855,7 +867,9 @@ def main():
         callback = None
     else:
         origin_weights = None
-        callback = EarlyStoppingCallback(early_stopping_patience=3)
+        callback = EarlyStoppingCallback(early_stopping_patience=training_args.patience)
+    
+    # scheduler = get_scheduler(scheduler_args, optimizer, training_args)
     # Initialize our Trainer
     trainer = CustomTrainer(
         model=model,
