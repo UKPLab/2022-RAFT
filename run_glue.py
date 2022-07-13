@@ -62,6 +62,8 @@ from transformers_modified.trainer_utils import PREFIX_CHECKPOINT_DIR, HPSearchB
 from RecAdam import RecAdam, anneal_function
 from transformers_modified.modeling import BertForSequenceClassification
 from schedules import get_scheduler
+import pickle
+from rational.torch import Rational
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 # check_min_version("4.18.0.dev0")
@@ -512,6 +514,13 @@ def main():
             revision=model_args.model_revision,
             use_auth_token=True if model_args.use_auth_token else None,
         )
+
+    print('rational functions', Rational.list)
+    if training_args.save_rational_plots:
+        file_path = os.path.join('./pkl_files', data_args.task_name + '_' + training_args.seed+ '.pkl')
+        with open(file_path,'wb') as f:
+            pickle.dump(Rational.list,file_path)
+        exit()
 
     # Preprocessing the raw_datasets
     if data_args.task_name is not None:
