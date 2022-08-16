@@ -58,6 +58,7 @@ class CustomWandbCallback(WandbCallback):
     ):
         if args.save_rational_plots and len(Rational.list) > 0:
             Rational.capture_all(f"Global Step {state.global_step}")
+            Rational.save_all_inputs(True)
             # filename = f"{args.output_dir}/ra_{state.global_step}.png"
             # Rational.export_graphs(filename)
             # self._wandb.log(
@@ -67,19 +68,27 @@ class CustomWandbCallback(WandbCallback):
                 # }
             # )
 
-    def on_evaluate(self, args: CustomTrainingArguments, state, control, **kwargs):
-
-        if args.save_rational_plots:
-            image_dir  = os.path.join(self.normal_image_dir, args.run_name)
-            if not os.path.exists(image_dir):
-                os.mkdir(image_dir)
-            filename = os.path.join(image_dir, f"{args.approx_func}_RF.jpg")
-            Rational.capture_all(name = "func")
-            Rational.export_graphs(path = filename)
-
+    # def on_evaluate(self, args: CustomTrainingArguments, state, control, **kwargs):
+    #     
+    #     if args.save_rational_plots and state.global_step % 500 == 0 and state.global_step < 4000:
+            
+    #         image_dir  = os.path.join(self.normal_image_dir, args.run_name)
+    #         try:
+    #             if not os.path.exists(image_dir):
+    #                 os.mkdir(image_dir)
+    #         except:
+    #             pass
+    #         filename = os.path.join(image_dir, f"{args.approx_func}_RF_{state.global_step}.jpg")
+    #         Rational.capture_all(name = "func")
+    #         Rational.export_graphs(path = filename)
+    
+    # def on_prediction_step(self, args: CustomTrainingArguments, state, control, **kwargs):
+    #     if args.save_rational_plots:
+    #         Rational.capture_all(name = "func")
+    #         Rational.save_all_inputs(True)
 
     def on_train_end(self, args:CustomTrainingArguments, state, control, model=None, tokenizer=None, **kwargs):
-        if args.save_rational_plots:
+        if args.save_rational_plots and args.local_rank in [-1, 0]:
             # if state.global_step % args.logging_steps == 0 and len(Rational.list) > 0:
             if args.do_pruning:
                 image_dir  = os.path.join(self.pruned_image_dir, args.run_name)

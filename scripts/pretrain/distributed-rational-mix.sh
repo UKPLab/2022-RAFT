@@ -21,7 +21,7 @@ export WANDB_PROJECT="Pretraining"
 
 # module load cuda/11.1
 # change name, config file, batch size, graident steps,  logging_steps, config:wikitext-2-raw-v1, 
-torchrun --nproc_per_node=2 \
+torchrun --nproc_per_node=4 \
     --nnodes=1 \
     --master_port 6062 \
     run_mlm.py \
@@ -29,7 +29,7 @@ torchrun --nproc_per_node=2 \
     --model_name_or_path roberta-base \
     --tokenizer_name roberta-base \
     --dataset_name bookcorpus \
-    --config_name ./outputs/roberta/${config_name} \
+    --config_name ./configs/${config_name} \
     --per_device_train_batch_size 32 \
     --gradient_accumulation_steps 4 \
     --per_device_eval_batch_size 32 \

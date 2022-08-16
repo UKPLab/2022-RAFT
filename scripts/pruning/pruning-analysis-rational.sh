@@ -1,16 +1,16 @@
 #!/bin/bash
 #SBATCH -J pruning-analysis-rational
-#SBATCH -e /ukp-storage-1/fang/rational_bert/logs/pruning/imp.err.%x
-#SBATCH -o /ukp-storage-1/fang/rational_bert/logs/pruning/imp.out.%x
+#SBATCH -e /ukp-storage-1/fang/rational_bert/logs/pruning/%x.err
+#SBATCH -o /ukp-storage-1/fang/rational_bert/logs/pruning/%x.out
 #SBATCH -n 1
 #SBATCH --mem=20G 
 #SBATCH --gres=gpu:1
 
 # change name, logging_steps,metric_for_best_model
 activate_func='rational'
-rational_layers="6-11"
+rational_layers="0-11"
 lr=5e-5
-task_name="mrpc"
+task_name="sst2"
 
 
 echo JOB ID: "${SLURM_JOBID}"
@@ -23,8 +23,8 @@ module load cuda/11.1
 
 # torchrun --nproc_per_node=1 \
 python pruning_analysis.py \
-  --model_name_or_path /ukp-storage-1/fang/pretrain_bert/outputs/mrpc/mix/pruning/6-11/checkpoint-3105 \
-  --model_type roberta \
+  --model_name_or_path /ukp-storage-1/fang/rational_bert/outputs/sst2/rational/pruning/0-11/checkpoint-37890 \
+  --model_type bert \
   --task_name $task_name \
   --do_train \
   --max_seq_length 128 \
@@ -33,6 +33,7 @@ python pruning_analysis.py \
   --learning_rate $lr \
   --rational_layers $rational_layers \
   --num_train_epochs 30 \
-  --output_dir ./outputs/$task_name/$activate_func/pruning/ 
+  --output_dir ./outputs/$task_name/$activate_func/pruning/ \
+  --academicBERT \
   # --save_rational_plots \
   # --overwrite_output_dir

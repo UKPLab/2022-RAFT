@@ -28,7 +28,7 @@ from argparse import Namespace
 from itertools import chain
 from unicodedata import name
 import datasets
-from datasets import Dataset, DatasetDict, load_dataset, load_metric
+from datasets import Dataset, DatasetDict, load_dataset, load_metric, concatenate_datasets
 from schedules import get_scheduler
 from timeit import default_timer as get_now
 import transformers_modified as transformers
@@ -169,6 +169,13 @@ def main():
         raw_datasets = load_dataset(data_args.dataset_name,
                                     data_args.dataset_config_name,
                                     cache_dir=model_args.cache_dir)
+
+        if data_args.extra_dataset:
+            raw_extra_datasets = load_dataset(data_args.extra_dataset,
+                                        cache_dir=model_args.cache_dir)
+
+            raw_datasets['train'] = concatenate_datasets([raw_datasets['train'], raw_extra_datasets['train']])
+
         if "validation" not in raw_datasets.keys():
             raw_datasets["validation"] = load_dataset(
                 data_args.dataset_name,
@@ -453,7 +460,7 @@ def main():
                 remove_columns=column_names,
                 load_from_cache_file=not data_args.overwrite_cache,
                 desc="Running tokenizer on every text in dataset",
-                cache_file_names={k:os.path.join(model_args.cache_dir, args.dataset_name, k+"_" + args.dataset_name +  model_args.tokenizer_name + "_" + str(data_args.max_seq_length) + "_"+ training_args.model_type+'.arrow') for k in raw_datasets}
+                cache_file_names={k:os.path.join(model_args.cache_dir, args.dataset_name, k+"_" + args.dataset_name + args.extra_dataset + model_args.tokenizer_name + "_" + str(data_args.max_seq_length) + "_"+ training_args.model_type+'.arrow') for k in raw_datasets}
             )
 
         # Main data processing function that will concatenate all texts from our dataset and generate chunks of
@@ -464,8 +471,8 @@ def main():
             total_length = len(concatenated_examples[list(examples.keys())[0]])
             # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
             # # customize this part to your needs.
-            if total_length >= max_seq_length:
-                total_length = (total_length // max_seq_length) * max_seq_length
+            if total_length >= truncated_seq_length:
+                total_length = (total_length // truncated_seq_length) * truncated_seq_length
             
             # # Split by chunks of max_len.
             res_dic = {}
@@ -533,7 +540,7 @@ def main():
                 num_proc=data_args.preprocessing_num_workers,
                 load_from_cache_file=not data_args.overwrite_cache,
                 desc=f"Grouping texts in chunks of {max_seq_length}",
-                cache_file_names={k:os.path.join(model_args.cache_dir, args.dataset_name, "grouped_" + k +"_" + args.dataset_name +  model_args.tokenizer_name + "_" + str(data_args.max_seq_length) + "_"+ training_args.model_type+'.arrow') for k in raw_datasets}
+                cache_file_names={k:os.path.join(model_args.cache_dir, args.dataset_name,  "grouped_" + k +"_" + args.dataset_name + args.extra_dataset + model_args.tokenizer_name + "_" + str(data_args.max_seq_length) + "_"+ training_args.model_type+'.arrow') for k in raw_datasets}
             )
                             
     if training_args.do_train:
@@ -657,6 +664,10 @@ def main():
             # c = [k for k, v in model.named_parameters() if any (l in k for l in pretrained_layers)]
 
     else:
+        # for k, v in model.named_parameters():
+        #     if any(param in k for param in rational):
+        #         v.requires_grad = False
+    
         grouped_params = [{
             "params": [
                 v for k, v in model.named_parameters()
@@ -665,7 +676,7 @@ def main():
             "lr":
             training_args.rational_lr,
             "weight_decay":
-            0.0
+            training_args.rational_weight_decay
         }, {
             "params": [
                 v for k, v in model.named_parameters()
@@ -704,6 +715,8 @@ def main():
         scheduler = None
     training_args.warmup_proportion_list = schedule_args.warmup_proportion_list
 
+    # for k,v in model.named_parameters():
+    #     print(k, v)
 
     # Initialize our Trainer
     trainer = CustomTrainer(

@@ -23,13 +23,15 @@ import os
 import random
 import timeit
 from unittest import result
+from cachetools import cached
 import wandb
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
-import collections
+import sys
+print("system path", sys.path)
 from rational.torch import Rational
 import transformers_modified as transformers
 from transformers_modified import (
@@ -54,6 +56,7 @@ from transformers_modified.modeling import BertForQuestionAnswering
 from schedules import get_scheduler
 from args import SchedulerArgs
 from torch.utils.data import Subset
+import pickle
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -66,9 +69,6 @@ logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_QUESTION_ANSWERING_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
-wandb.init(project="squad")
-wandb.run.define_metric("global_step")
-wandb.run.define_metric("*", step_metric="global_step", step_sync=True)
 
 
 def set_seed(args):
@@ -105,6 +105,13 @@ def train(args, train_dataset, eval_dataset, eval_examples, eval_features, model
 
     rational = ['numerator', 'denominator']
     no_decay = ["bias", "LayerNorm.weight"]
+
+    if args.frozen_rf:
+        for k, v in model.named_parameters():
+            if any(name in k for name in rational):
+                v.requires_grad=False
+        logger.info("rationals have been frozen!")
+
     grouped_params = [{
             "params": [
                 v for k, v in model.named_parameters()
@@ -113,7 +120,7 @@ def train(args, train_dataset, eval_dataset, eval_examples, eval_features, model
             "lr":
             args.rational_lr,
             "weight_decay":
-            0.0
+            args.weight_decay
         }, {
             "params": [
                 v for k, v in model.named_parameters()
@@ -283,6 +290,8 @@ def train(args, train_dataset, eval_dataset, eval_examples, eval_features, model
                 global_step += 1
 
                 # Log metrics
+                if args.logging_steps ==0:
+                    args.logging_steps = len(train_dataloader) // args.gradient_accumulation_steps
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Only evaluate when single GPU otherwise metrics may not average well
                     if (args.local_rank == -1 or args.local_rank == 0) and args.evaluate_during_training:
@@ -290,11 +299,13 @@ def train(args, train_dataset, eval_dataset, eval_examples, eval_features, model
                         if results['f1'] > best_f1:
                             best_f1 = results['f1']
                             best_step = global_step
-                        wandb.log({'eval_f1': results['f1']})
+                        wandb.log({'eval_f1': results['f1'], 'em': results['exact']})
                         for key, value in results.items():
                             logger.info(f"Evaluating {key}: {value}..., global steps:{global_step}")
                             # tb_writer.add_scalar("eval_{}".format(key), value, global_step)
                     Rational.capture_all(f"Global Step {global_step}")
+                    Rational.save_all_inputs(True)
+
                     lr = scheduler.get_last_lr()
                     loss = (tr_loss - logging_loss) / args.logging_steps
                     # tb_writer.add_scalar("rational_lr", lr[0], global_step)
@@ -304,6 +315,9 @@ def train(args, train_dataset, eval_dataset, eval_examples, eval_features, model
                     logging_loss = tr_loss
 
                 # Save model checkpoint
+                if args.save_steps == 0:
+                    args.save_steps = len(train_dataloader) // args.gradient_accumulation_steps
+                    
                 if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
                     output_dir = os.path.join(args.output_dir, "checkpoint-{}".format(global_step))
                     # Take care of distributed/parallel training
@@ -388,7 +402,7 @@ def evaluate(args, model, dataset, examples, features, tokenizer, prefix=""):
 
             unique_id = int(eval_feature.unique_id)
 
-            output = [to_list(output[i]) for output in outputs]
+            output = [to_list(output[i]) for output in outputs if output is not None]
             # Some models (XLNet, XLM) use 5 arguments for their predictions, while the other "simpler"
             # models only use two.
             if len(output) >= 5:
@@ -476,16 +490,27 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, predict=False, outp
     # Load data features from cache or dataset file
     input_dir = args.data_dir if args.data_dir else "."
     if not args.cached_file:
-        cached_features_file = os.path.join(
-            input_dir,
-            "cached_{}_{}_{}".format(
-                "dev" if evaluate else "predict" if predict else "train",
-                str(args.max_seq_length),
-                str(max_eval_examples) if max_eval_examples else str(max_train_examples) if max_train_examples else ""
-            ),
-        )
+        if max_train_examples or max_eval_examples:
+            cached_features_file = os.path.join(
+                input_dir,
+                "cached_{}_{}_{}_rnd{}".format(
+                    "dev" if evaluate else "predict" if predict else "train",
+                    str(args.max_seq_length),
+                    str(max_eval_examples) if max_eval_examples else str(max_train_examples) if max_train_examples else "",
+                    str(args.seed) 
+                ),
+            )
+        else:
+            cached_features_file = os.path.join(
+                input_dir,
+                "cached_{}_{}_".format(
+                    "dev" if evaluate else "predict" if predict else "train",
+                    str(args.max_seq_length),
+                ),
+            )
+
     else:
-        cached_features_file = args.cached_file
+        cached_features_file = os.path.join(args.data_dir, args.cached_file)
 
     # Init features and dataset from cache if it exists
     if os.path.exists(cached_features_file) and not args.overwrite_cache:
@@ -517,12 +542,15 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, predict=False, outp
             elif evaluate:
                 examples = processor.get_dev_examples(args.data_dir, filename=args.eval_file)
                 if max_eval_examples:
+                    random.seed(args.seed)
+                    random.shuffle(examples)
                     examples = examples[:max_eval_examples]
             else:
                 examples = processor.get_train_examples(args.data_dir, filename=args.train_file)
                 if max_train_examples:
-                    examples = examples[:max_train_examples]
-
+                    random.seed(args.seed)
+                    train_ixs = random.sample(range(len(examples)), max_train_examples)
+                    examples = [examples[i] for i in train_ixs]
 
         features, dataset = squad_convert_examples_to_features(
             examples=examples,
@@ -558,6 +586,11 @@ def main():
         type=str,
         required=True,
         help="Model type selected in the list: " + ", ".join(MODEL_TYPES),
+    )
+    parser.add_argument(
+        "--frozen_rf",
+        action="store_true",
+        help="donot update rational",
     )
     parser.add_argument(
         "--model_name_or_path",
@@ -665,7 +698,7 @@ def main():
 
     parser.add_argument(
         "--img_dir",
-        default="/ukp-storage-1/fang/rational_bert/logs/images/normal",
+        default="/storage/ukp/work/fang/rational_bert/logs/images/normal",
         type=str
     )
     
@@ -794,8 +827,15 @@ def main():
     parser.add_argument(
         "--academicBERT",
         action="store_true",
-        help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit",
+        help="",
     )
+
+    parser.add_argument(
+        "--save_rational_functions",
+        action="store_true",
+        help="Whether to save rational functions",
+    )
+    
 
     parser.add_argument(
         "--fp16_opt_level",
@@ -842,7 +882,7 @@ def main():
                 args.output_dir
             )
         )
-    wandb.run.name = args.run_name
+    
     # Setup distant debugging if needed
     if args.server_ip and args.server_port:
         # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
@@ -853,6 +893,12 @@ def main():
         ptvsd.wait_for_attach()
 
     # Setup CUDA, GPU & distributed training
+    # args.local_rank = int(os.environ["LOCAL_RANK"])
+    if args.local_rank in [0,-1]:
+        wandb.init()
+        wandb.run.define_metric("global_step")
+        wandb.run.define_metric("*", step_metric="global_step", step_sync=True)
+        wandb.run.name = args.run_name
     if args.local_rank == -1 or args.no_cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
         args.n_gpu = 0 if args.no_cuda else torch.cuda.device_count()
@@ -906,7 +952,7 @@ def main():
                                        int(layers[1]) + 1)])
         else:
             rational_layers.append(layer)
-
+    print("layers with rational", rational_layers)
     config.rational_layers = rational_layers
     config.logging_steps = args.logging_steps
 
@@ -924,6 +970,13 @@ def main():
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
             cache_dir=args.cache_dir)
+
+        if args.save_rational_functions:
+            file_path = os.path.join('./pkl_files', 'full_data_' + "squad" + '_' + str(args.seed)+ '.pkl')
+            # file_path = os.path.join('./pkl_files',  'pretrained_' + str(training_args.seed)+ '.pkl')
+            with open(file_path,'wb') as f:
+                pickle.dump(Rational.list,f)
+            exit()
     else:
         model = AutoModelForQuestionAnswering.from_pretrained(
             args.model_name_or_path,
@@ -960,7 +1013,11 @@ def main():
         train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False,max_train_examples=args.max_train_samples,save=True)
         eval_dataset, eval_examples, eval_features = load_and_cache_examples(args, tokenizer, evaluate=True, output_examples=True,max_eval_examples=args.max_dev_samples, save=True)
 
- 
+        # print('train_dataset', len(train_dataset))
+        # print('eval_dataset', len(eval_dataset))
+        # print('length dataset', len(train_dataset)+len(eval_dataset))
+        # exit()
+
         global_step, tr_loss = train(args, train_dataset, eval_dataset, eval_examples, eval_features, model, tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
         if args.save_rational_plot:
@@ -1017,24 +1074,22 @@ def main():
         # logger.info("Evaluate the following checkpoints: %s", checkpoints)
 
         if best_step:
-            print(f'loadding best checkpoint {best_step}')
+            print(f'loading best checkpoint {best_step}')
             model_path = os.path.join(args.output_dir, "checkpoint-{}".format(best_step))
             model = BertForQuestionAnswering.from_pretrained(model_path,
                 from_tf=bool(".ckpt" in args.model_name_or_path),
                 config=config,
                 cache_dir=args.cache_dir)
             model.to(args.device)
-        # for checkpoint in checkpoints:
-        #     # Reload the model
-        #     global_step = checkpoint.split("-")[-1] if len(checkpoints) > 1 else ""
-        #     model = AutoModelForQuestionAnswering.from_pretrained(checkpoint)  # , force_download=True)
-        #     model.to(args.device)
+
 
         # Evaluate
         dataset, examples, features = load_and_cache_examples(args, tokenizer, predict=True, output_examples=True)
 
         result = evaluate(args, model, dataset, examples, features, tokenizer, prefix="")
-        wandb.log({'pred_f1': result['f1']})
+        if not global_step:
+            global_step= 1
+        wandb.log({'pred_f1': result['f1'], 'pred_em': result['exact'], 'global_step':global_step})
         result = dict((k + ("_{}".format(global_step) if global_step else ""), v) for k, v in result.items())
         results.update(result)
 

@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from optparse import Option
 from typing import Optional, List
 import os
+from attr import frozen
 from torch import OptionalType
 from transformers_modified import TrainingArguments
 
@@ -78,6 +79,7 @@ class CustomTrainingArguments(TrainingArguments):
         default="gelu", metadata={"help": "specify which layer to use rationals, 0-11 means all layers"})
 
     save_rational_plots: bool = False
+    save_rational_functions: bool = False
     zero_shot: bool = False
     run_name: str = field(
         default="run1",
@@ -85,6 +87,11 @@ class CustomTrainingArguments(TrainingArguments):
             "help": "wandb run name"
         }
     )
+    frozen_rf: bool = False
+    frozen_model: bool = False
+    bitfit_rf: bool=False
+    bitfit: bool=False
+    patience: int = 8
     scale_cnt_limit: int = 5
     do_pruning: bool = False
     sparse_mask_prediction: bool = False
@@ -96,9 +103,18 @@ class CustomTrainingArguments(TrainingArguments):
 
     do_mix: bool = False
 
+    ch_rf: bool = False
+
+    sub_bias: bool =False
+
     total_training_time: Optional[float] = field(
         default=24.0, metadata={"help": "Max hours for pre-training)"}
     )
+
+    rational_weight_decay: Optional[float] = field(
+        default=0.1
+    )
+    name_suffix: Optional[str] = "_"
 
     freeze_pl: bool = False
 
@@ -115,6 +131,7 @@ class CustomTrainingArguments(TrainingArguments):
     recadam_anneal_k: Optional[float] = field(default=0.5, metadata={"help":"k for the annealing function in RecAdam."})                    
     recadam_anneal_t0: Optional[int] = field(default=250, metadata={"help":"t0 for the annealing function in RecAdam."})
     recadam_pretrain_cof: Optional[float] = field(default=5000.0, metadata={"help":"tCoefficient of the quadratic penalty in RecAdam. Default 5000.0."})
+    predict_train_file: bool = False
 
 @dataclass
 class DataTrainingArguments:
@@ -125,6 +142,11 @@ class DataTrainingArguments:
     dataset_name: Optional[str] = field(
         default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
     )
+
+    extra_dataset: Optional[str] = field(
+        default="", metadata={"help": "The name of the dataset to use (via the datasets library)."}
+    )
+    
     dataset_config_name: Optional[str] = field(
         default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
     )
@@ -137,7 +159,7 @@ class DataTrainingArguments:
         default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
     )
     validation_split_percentage: Optional[int] = field(
-        default=5,
+        default=1,
         metadata={
             "help": "The percentage of the train set used as validation set in case there's no validation split"
         },
@@ -336,9 +358,9 @@ class SchedulerArgs:
         },
     )
 
-    warmup_proportion_list: Optional[List[float]] = field(default=0.06, metadata={"help": "Warmup proportion"})
+    warmup_proportion_list: Optional[List[float]] = field(default=None, metadata={"help": "Warmup proportion"})
     decay_rate: Optional[float] = field(default=0.99, metadata={"help": "Decay rate"})
     decay_step: Optional[int] = field(default=1000, metadata={"help": "Decay step"})
-    num_warmup_steps: Optional[int] = field(
-        default=1000, metadata={"help": "Number of warmup steps"}
+    num_warmup_steps: Optional[List[int]] = field(
+        default=None, metadata={"help": "Number of warmup steps"}
     )

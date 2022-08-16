@@ -16,7 +16,7 @@ source /ukp-storage-1/fang/miniconda3/bin/activate /ukp-storage-1/fang/miniconda
 python run_mlm.py \
     --model_name_or_path /ukp-storage-1/fang/pretrain_bert/outputs/roberta/rational/0.01/checkpoint-29509 \
     --dataset_name wikitext \
-    --config_name ./outputs/roberta/config_large.json \
+    --config_name ./configs/config_large.json \
     --tokenizer_name roberta-base \
     --dataset_config_name wikitext-2-raw-v1 \
     --per_device_train_batch_size 16 \
@@ -26,6 +26,7 @@ python run_mlm.py \
     --logging_steps 1283 \
     --tb_dir ./runs/$activate_func \
     --save_steps  1283 \
+    --save_rational_plots \
     --max_seq_length 128 \
     --learning_rate $lr \
     --preprocessing_num_workers 4 \

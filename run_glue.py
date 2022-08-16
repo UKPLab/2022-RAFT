@@ -16,18 +16,24 @@
 """ Finetuning the library models for sequence classification on GLUE."""
 # You can also adapt this script on your own text classification task. Pointers for this are left as comments.
 
+from asyncore import write
+from cProfile import label
+from doctest import Example
+from functools import reduce
 import logging
 import os
 import random
 import sys
-
+import collections
 import datasets
 import numpy as np
 from datasets import load_dataset, load_metric
+import sys
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 import random
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
+from run_squad import train
 import transformers_modified as transformers
 from transformers_modified import (
     AutoConfig,
@@ -43,13 +49,15 @@ from transformers_modified import (
     default_data_collator,
     set_seed,
 )
-from transformers_modified.file_utils import is_torch_tpu_available
+from transformers_modified.file_utils import is_torch_tpu_available, is_sagemaker_mp_enabled
 from transformers_modified.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers_modified.data.data_collator import DataCollator
 from transformers_modified.modeling_utils import PreTrainedModel
+from transformers_modified.deepspeed import deepspeed_init
+from transformers_modified.trainer_pt_utils import find_batch_size, nested_concat, nested_truncate, nested_numpify, IterableDatasetShard
 from torch import nn
 from transformers_modified.trainer_callback import TrainerCallback
-from transformers_modified.trainer_utils import get_last_checkpoint
+from transformers_modified.trainer_utils import get_last_checkpoint, denumpify_detensorize, EvalLoopOutput
 from transformers_modified import EarlyStoppingCallback
 from transformers_modified.utils import check_min_version
 from transformers_modified.utils.versions import require_version
@@ -59,11 +67,11 @@ from transformers_modified.integrations import INTEGRATION_TO_CALLBACK
 from pruning_utils import parameters_to_prune, original_params
 import torch.nn.utils.prune as prune
 from transformers_modified.trainer_utils import PREFIX_CHECKPOINT_DIR, HPSearchBackend
-from RecAdam import RecAdam, anneal_function
 from transformers_modified.modeling import BertForSequenceClassification
 from schedules import get_scheduler
 import pickle
 from rational.torch import Rational
+from random_mask import set_uniform_mask
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 # check_min_version("4.18.0.dev0")
@@ -105,13 +113,16 @@ class CustomTrainer(Trainer):
                  optimizers: Tuple[torch.optim.Optimizer,
                                    torch.optim.lr_scheduler.LambdaLR] = (None,
                                                                          None),
-                 origin_params: Dict = None):
+                 origin_params: Dict = None,
+                 masks: Optional[Dict] = None
+                 ):
 
         super().__init__(model, args, data_collator, train_dataset,
                          eval_dataset, tokenizer, model_init, compute_metrics,
                          callbacks, optimizers)
         self.pruning_step = 0
         self.origin_params = origin_params
+        self.masks = masks
 
     def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch,
                                  ignore_keys_for_eval):
@@ -195,6 +206,75 @@ class CustomTrainer(Trainer):
                         mask_dict[key] = model_dict[key]
                 self._save_mask_dict(mask_dict=mask_dict, trial=None)
 
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        """
+        Perform a training step on a batch of inputs.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (`nn.Module`):
+                The model to train.
+            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument `labels`. Check your model's documentation for all accepted arguments.
+
+        Return:
+            `torch.Tensor`: The tensor with training loss on this batch.
+        """
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+        is_break = False
+        if is_sagemaker_mp_enabled():
+            scaler = self.scaler if self.do_grad_scaling else None
+            loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps, scaler=scaler)
+            return loss_mb.reduce_mean().detach().to(self.args.device)
+
+        with self.autocast_smart_context_manager():
+            # start = time.time()
+            loss, output = self.compute_loss(model, inputs, return_outputs=True)
+            # end = time.time()
+            # print('compute loss', end-start)
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+        if self.args.fp16:
+            if self.state.global_step > 650 and self.args.deepspeed and hasattr(self.optimizer, 'cur_scale'):
+                print('optmizer curscale', self.optimizer.cur_scale)
+            if (self.args.fp16 or self.args.bf16) and hasattr(self.optimizer, 'cur_scale') and self.optimizer.cur_scale == 1:
+                self.scale_counter_at_1 += 1
+                logger.info(f"Optimizer scale reach one {self.scale_counter_at_1} times")
+
+            if self.scale_counter_at_1 >= self.args.scale_cnt_limit:
+                self.scale_counter_at_1 = 0
+                is_break =True
+                return loss, is_break
+                        
+        if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+            # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
+            loss = loss / self.args.gradient_accumulation_steps
+
+        if self.do_grad_scaling:
+            self.scaler.scale(loss).backward()
+        elif self.use_apex:
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        elif self.deepspeed:
+            # loss gets scaled under gradient_accumulation_steps in deepspeed
+            loss = self.deepspeed.backward(loss)
+        else:
+            loss.backward()
+        if self.masks:
+            # print(self.masks)
+            for k, v in model.named_parameters():
+                if v.grad is not None and 'classifier' not in k:
+                # print(k)
+                # print(self.masks[k])
+                    v.grad[~self.masks[k]] = 0
+
+        return loss.detach(), is_break
+
     def _save_mask_dict(self, trial, mask_dict):
         checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
 
@@ -252,6 +332,204 @@ class CustomTrainer(Trainer):
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
 
         return (loss, outputs) if return_outputs else loss
+    def evaluation_loop(
+        self,
+        dataloader: DataLoader,
+        description: str,
+        prediction_loss_only: Optional[bool] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> EvalLoopOutput:
+        """
+        Prediction/evaluation loop, shared by `Trainer.evaluate()` and `Trainer.predict()`.
+
+        Works both with or without labels.
+        """
+        args = self.args
+
+        prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
+
+        # if eval is called w/o train init deepspeed here
+        if args.deepspeed and not self.deepspeed:
+
+            # XXX: eval doesn't have `resume_from_checkpoint` arg but we should be able to do eval
+            # from the checkpoint eventually
+            deepspeed_engine, _, _ = deepspeed_init(
+                self, num_training_steps=0, resume_from_checkpoint=None, inference=True
+            )
+            self.model = deepspeed_engine.module
+            self.model_wrapped = deepspeed_engine
+            self.deepspeed = deepspeed_engine
+
+        model = self._wrap_model(self.model, training=False)
+
+        # if full fp16 or bf16 eval is wanted and this ``evaluation`` or ``predict`` isn't called
+        # while ``train`` is running, cast it to the right dtype first and then put on device
+        if not self.is_in_train:
+            if args.fp16_full_eval:
+                model = model.to(dtype=torch.float16, device=args.device)
+            elif args.bf16_full_eval:
+                model = model.to(dtype=torch.bfloat16, device=args.device)
+
+        batch_size = dataloader.batch_size
+
+        logger.info(f"***** Running {description} *****")
+        if isinstance(dataloader.dataset, collections.abc.Sized):
+            logger.info(f"  Num examples = {self.num_examples(dataloader)}")
+        else:
+            logger.info("  Num examples: Unknown")
+        logger.info(f"  Batch size = {batch_size}")
+
+        model.eval()
+
+        self.callback_handler.eval_dataloader = dataloader
+        # Do this before wrapping.
+        eval_dataset = dataloader.dataset
+
+        if is_torch_tpu_available():
+            dataloader = pl.ParallelLoader(dataloader, [args.device]).per_device_loader(args.device)
+
+        if args.past_index >= 0:
+            self._past = None
+
+        # Initialize containers
+        # losses/preds/labels on GPU/TPU (accumulated for eval_accumulation_steps)
+        losses_host = None
+        preds_host = None
+        labels_host = None
+        hidden_states_host = []
+        # losses/preds/labels on CPU (final containers)
+        all_losses = None
+        all_preds = None
+        all_labels = None
+        # Will be useful when we have an iterable dataset so don't know its length.
+
+        observed_num_examples = 0
+        # Main evaluation loop
+        inter_outputs = None
+        for step, inputs in enumerate(dataloader):
+            # Update the observed num examples
+            observed_batch_size = find_batch_size(inputs)
+            if observed_batch_size is not None:
+                observed_num_examples += observed_batch_size
+                # For batch samplers, batch_size is not known by the dataloader in advance.
+                if batch_size is None:
+                    batch_size = observed_batch_size
+
+            # Prediction step
+            loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+            #[32, 768]
+            # hidden_states = hidden_states[-1][:,0,:]
+            # print('hidden_states', hidden_states.size())
+            # exit()
+            # hidden_states = [i[:,0,:].detach().cpu().numpy() for i in hidden_states]
+            # print(hidden_states[0].shape)
+            # exit()
+            # inter_output = logits[-1]
+            # inter_output = inter_output.view(1,-1)
+            # inter_outputs = inter_output if inter_outputs is None else torch.cat([inter_outputs, inter_output], axis=0)
+            
+            # logits = logits[0]
+            # select argmax
+            if len(logits.size()) == 3:
+                logits = torch.argmax(logits, axis = -1)
+            if is_torch_tpu_available():
+                xm.mark_step()
+
+            # Update containers on host
+            # hidden_states_host.append(hidden_states)
+            if loss is not None:
+                losses = self._nested_gather(loss.repeat(batch_size))
+                losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
+            if logits is not None:
+                logits = self._pad_across_processes(logits)
+                logits = self._nested_gather(logits)
+                preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
+
+
+            if labels is not None:
+                labels = self._pad_across_processes(labels)
+                labels = self._nested_gather(labels)
+                labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
+            self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
+
+            # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
+            if args.eval_accumulation_steps is not None and (step + 1) % args.eval_accumulation_steps == 0:
+                if losses_host is not None:
+                    losses = nested_numpify(losses_host)
+                    all_losses = losses if all_losses is None else np.concatenate((all_losses, losses), axis=0)
+                if preds_host is not None:
+                    logits = nested_numpify(preds_host)
+                    all_preds = logits if all_preds is None else nested_concat(all_preds, logits, padding_index=-100)
+                if labels_host is not None:
+                    labels = nested_numpify(labels_host)
+                    all_labels = (
+                        labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
+                    )
+
+                # Set back to None to begin a new accumulation
+                losses_host, preds_host, labels_host = None, None, None
+        # inter_outputs = torch.mean(inter_outputs, axis=0)
+        # inter_contribution = torch.argsort(inter_outputs)
+        # print('contribution of each layer', inter_contribution)
+        # print('contribution value of each layer', inter_outputs)
+
+        if args.past_index and hasattr(self, "_past"):
+            # Clean the state at the end of the evaluation loop
+            delattr(self, "_past")
+
+        # Gather all remaining tensors and put them back on the CPU
+        if losses_host is not None:
+            losses = nested_numpify(losses_host)
+            all_losses = losses if all_losses is None else np.concatenate((all_losses, losses), axis=0)
+        if preds_host is not None:
+            logits = nested_numpify(preds_host)
+            all_preds = logits if all_preds is None else nested_concat(all_preds, logits, padding_index=-100)
+            
+        if labels_host is not None:
+            labels = nested_numpify(labels_host)
+            all_labels = labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
+        # print("AAAAAAA")
+        # Number of samples
+        if not isinstance(eval_dataset, IterableDataset):
+            num_samples = len(eval_dataset)
+        # The instance check is weird and does not actually check for the type, but whether the dataset has the right
+        # methods. Therefore we need to make sure it also has the attribute.
+        elif isinstance(eval_dataset, IterableDatasetShard) and hasattr(eval_dataset, "num_examples"):
+            num_samples = eval_dataset.num_examples
+        else:
+            num_samples = observed_num_examples
+        # print('bbbb')
+        # Number of losses has been rounded to a multiple of batch_size and in a distributed training, the number of
+        # samplers has been rounded to a multiple of batch_size, so we truncate.
+        if all_losses is not None:
+            all_losses = all_losses[:num_samples]
+        if all_preds is not None:
+            all_preds = nested_truncate(all_preds, num_samples)
+        if all_labels is not None:
+            all_labels = nested_truncate(all_labels, num_samples)
+        # print('cccc')
+        # Metrics!
+        if self.compute_metrics is not None and all_preds is not None and all_labels is not None:
+            metrics = self.compute_metrics(EvalPrediction(predictions=all_preds, label_ids=all_labels))
+        else:
+            metrics = {}
+        # print('dddd')
+        # To be JSON-serializable, we need to remove numpy types or zero-d tensors
+        metrics = denumpify_detensorize(metrics)
+        # print('eeee')
+        if all_losses is not None:
+            metrics[f"{metric_key_prefix}_loss"] = all_losses.mean().item()
+
+        # Prefix all keys with metric_key_prefix + '_'
+        for key in list(metrics.keys()):
+            if not key.startswith(f"{metric_key_prefix}_"):
+                metrics[f"{metric_key_prefix}_{key}"] = metrics.pop(key)
+        # print('fffff')
+        # hidden_states_host = torch.cat(hidden_states_host, axis=0)
+        # print(hidden_states_host)
+        # print(hidden_states_host.size())
+        return EvalLoopOutput(predictions=all_preds, label_ids=all_labels, metrics=metrics, num_samples=num_samples, hidden_states=None)
 
 
 def main():
@@ -326,6 +604,7 @@ def main():
     # download the dataset.
     if data_args.task_name is not None:
         # Downloading and loading a dataset from the hub.
+
         raw_datasets = load_dataset("glue",
                                     data_args.task_name,
                                     cache_dir=model_args.cache_dir)
@@ -516,10 +795,11 @@ def main():
         )
 
     print('rational functions', Rational.list)
-    if training_args.save_rational_plots:
-        file_path = os.path.join('./pkl_files', data_args.task_name + '_' + training_args.seed+ '.pkl')
+    if training_args.save_rational_functions:
+        file_path = os.path.join('./pkl_files', 'full_data_' + data_args.task_name + '_' + str(training_args.seed)+ '.pkl')
+        # file_path = os.path.join('./pkl_files',  'pretrained_' + str(training_args.seed)+ '.pkl')
         with open(file_path,'wb') as f:
-            pickle.dump(Rational.list,file_path)
+            pickle.dump(Rational.list,f)
         exit()
 
     # Preprocessing the raw_datasets
@@ -542,168 +822,96 @@ def main():
     # set optimizer for rational and others
     rational = ["numerator", "denominator"]
     no_decay = ["bias", "LayerNorm.weight"]
-    if training_args.optimizer.lower() != "recadam":
-        grouped_params = [{
-            "params": [
-                v for k, v in model.named_parameters()
-                if any(param in k for param in rational)
-            ],
-            "lr":
-            training_args.rational_lr,
-            "weight_decay":training_args.weight_decay
-        }, {
-            "params": [
-                v for k, v in model.named_parameters()
-                if not any(param in k for param in rational) and not any(
-                    n in k for n in no_decay)
-            ],
-            "lr":
-            training_args.learning_rate,
-            "weight_decay":
-            training_args.weight_decay
-        }, {
-            "params": [
-                v for k, v in model.named_parameters()
-                if not any(param in k
-                           for param in rational) and any(n in k
-                                                          for n in no_decay)
-            ],
-            "lr":
-            training_args.learning_rate,
-            "weight_decay":
-            0.0
-        }]
-        # optimizer = torch.optim.Adam(grouped_params,
-                                    #  lr=training_args.learning_rate)
-        optimizer = AdamW(grouped_params, lr=training_args.learning_rate, weight_decay=training_args.weight_decay)
-    else:
-        logger.info("Using RecAdam....")
-        grouped_params = [
-            {  # rational
-                "params": [
-                    v for k, v in model.named_parameters()
-                    if any(param in k for param in rational)
-                ],
-                "lr":
-                training_args.rational_lr,
-                "weight_decay":
-                training_args.weight_decay,
-                "anneal_w":
-                0.0,
-                "pretrain_params": [
-                    v for k, v in model.named_parameters()
-                    if any(param in k for param in rational)
-                ]
-            },
-            {  # decay classification layer
-                "params": [
-                    v for k, v in model.named_parameters()
-                    if not any(param in k for param in rational) and not any(
-                        n in k for n in no_decay)
-                    and training_args.model_type not in k
-                ],
-                "lr":
-                training_args.learning_rate,
-                "weight_decay":
-                training_args.weight_decay,
-                "anneal_w":
-                0.0,
-                "pretrain_params": [
-                    v for k, v in pretrained_model.named_parameters()
-                    if not any(param in k for param in rational) and not any(
-                        n in k for n in no_decay)
-                    and training_args.model_type not in k
-                ]
-            },
-            {  # no decay classification layer
-                "params": [
-                    v for k, v in model.named_parameters()
-                    if not any(param in k for param in rational) and any(
-                        n in k for n in no_decay)
-                    and training_args.model_type not in k
-                ],
-                "lr":
-                training_args.learning_rate,
-                "weight_decay":
-                0.0,
-                "anneal_w":
-                0.0,
-                "pretrain_params": [
-                    v for k, v in pretrained_model.named_parameters()
-                    if not any(param in k for param in rational) and any(
-                        n in k for n in no_decay)
-                    and training_args.model_type not in k
-                ]
-            },
-            {  #decay in layer
-                "params": [
-                    v for k, v in model.named_parameters()
-                    if not any(param in k for param in rational) and not any(
-                        n in k
-                        for n in no_decay) and training_args.model_type in k
-                    and "intermediate.LayerNorm" not in k
-                ],
-                "lr":
-                training_args.learning_rate,
-                "weight_decay":
-                training_args.weight_decay,
-                "anneal_w":
-                training_args.recadam_anneal_w,
-                "pretrain_params": [
-                    v for k, v in pretrained_model.named_parameters()
-                    if not any(param in k for param in rational) and not any(
-                        n in k
-                        for n in no_decay) and training_args.model_type in k
-                ]
-            },
 
-            # no deacy in layer
-            {
-                "params": [
-                    v for k, v in model.named_parameters()
-                    if not any(param in k for param in rational) and any(
-                        n in k
-                        for n in no_decay) and training_args.model_type in k
-                    and "intermediate.LayerNorm" not in k
-                ],
-                "lr":
-                training_args.learning_rate,
-                "weight_decay":
-                0.0,
-                "anneal_w":
-                training_args.recadam_anneal_w,
-                "pretrain_params": [
-                    v for k, v in pretrained_model.named_parameters()
-                    if not any(param in k for param in rational) and any(
-                        n in k
-                        for n in no_decay) and training_args.model_type in k
-                ]
-            },
-            {  # layernorm
-                "params": [
-                    v for k, v in model.named_parameters()
-                    if "intermediate.LayerNorm" in k
-                ],
-                "lr":
-                training_args.learning_rate,
-                "weight_decay":
-                0.0,
-                "anneal_w":
-                0.0,
-                "pretrain_params": [
-                    v for k, v in model.named_parameters()
-                    if "intermediate.LayerNorm" in k
-                ]
-            }
-        ]
+    
+    # head
+    # trained_weights = ["pooler", "classifier"]
+    
+    # bitfit
+    # trained_weights = ["attention.self.key.bias", "classifier"]
+     # frozen rational activation functions
 
-        optimizer = RecAdam(grouped_params,
-                            lr=training_args.learning_rate,
-                            eps=training_args.adam_epsilon,
-                            anneal_fun=training_args.recadam_anneal_fun,
-                            anneal_k=training_args.recadam_anneal_k,
-                            anneal_t0=training_args.recadam_anneal_t0,
-                            pretrain_cof=training_args.recadam_pretrain_cof)
+    # used for subset bitfit
+    masks = None
+    if training_args.frozen_rf:
+        # uniform sample
+        # for k,v in model.named_parameters():
+        #     if 'classifier' in k:
+        #         num_tune_params += reduce(lambda x, y: x * y, v.shape)
+        # print("number of tuned params", num_tune_params)
+        # exit()
+        
+        for k, v in model.named_parameters():
+            if any(name in k for name in rational):
+                v.requires_grad=False
+        logger.info("rationals have been frozen!")
+    
+    elif training_args.bitfit or training_args.sub_bias:
+        # trained_weights = rational + ["classifier"]
+        trained_weights = ["bias","classifier"]
+        #bitfit+rational
+        # trained_weights += rational
+        for k, v in model.named_parameters():
+            # print(k)
+            if not any(name in k for name in trained_weights):
+                v.requires_grad=False
+            else:
+                print(k)
+        logger.info("using bitfit!")
+        if training_args.sub_bias:
+            num_tune_params = 117
+            masks = set_uniform_mask(model, num_tune_params)
+
+    elif training_args.bitfit_rf or training_args.ch_rf:
+        if training_args.bitfit_rf:
+            trained_weights = rational + ["bias","classifier"]
+        else:
+            trained_weights = rational + ["classifier"]
+        for k, v in model.named_parameters():
+            # print(k)
+            if not any(name in k for name in trained_weights):
+                v.requires_grad=False
+            else:
+                print(k)
+        logger.info("using bitfit(ch)-rf!")
+
+    
+    
+
+    grouped_params = [{
+        "params": [
+            v for k, v in model.named_parameters()
+            if any(param in k for param in rational)
+        ],
+        "lr":
+        training_args.rational_lr,
+        "weight_decay":training_args.weight_decay
+    }, {
+        "params": [
+            v for k, v in model.named_parameters()
+            if not any(param in k for param in rational) and not any(
+                n in k for n in no_decay)
+        ],
+        "lr":
+        training_args.learning_rate,
+        "weight_decay":
+        training_args.weight_decay
+    }, {
+        "params": [
+            v for k, v in model.named_parameters()
+            if not any(param in k
+                        for param in rational) and any(n in k
+                                                        for n in no_decay)
+        ],
+        "lr":
+        training_args.learning_rate,
+        "weight_decay":
+        0.0
+    }]
+    # optimizer = torch.optim.Adam(grouped_params,
+                                #  lr=training_args.learning_rate)
+    optimizer = AdamW(grouped_params, lr=training_args.learning_rate, weight_decay=training_args.weight_decay)
+
     # Padding strategy
     if data_args.pad_to_max_length:
         padding = "max_length"
@@ -777,13 +985,15 @@ def main():
             load_from_cache_file=not data_args.overwrite_cache,
             desc="Running tokenizer on dataset",
         )
-    if training_args.do_train:
+
+    train_eval_dataset = raw_datasets["train"]
+    train_eval_dataset = train_eval_dataset.shuffle(seed=96)
+    train_nums = int(len(train_eval_dataset) * 0.75)
+    
+    if training_args.do_train or training_args.do_predict:
         if "train" not in raw_datasets:
             raise ValueError("--do_train requires a train dataset")
-        train_eval_dataset = raw_datasets["train"]
-        train_eval_dataset = train_eval_dataset.shuffle(seed=96)
-  
-        train_nums = int(len(train_eval_dataset) * 0.75)
+        
         train_dataset = train_eval_dataset.select(range(train_nums))
 
         if data_args.max_train_samples is not None:
@@ -889,6 +1099,7 @@ def main():
         data_collator=data_collator,
         optimizers=(optimizer, None),
         origin_params=origin_weights,
+        masks=masks,
         callbacks=[callback])
     # trainer = Trainer(
     #     model=model,
@@ -948,6 +1159,17 @@ def main():
         # Loop to handle MNLI double evaluation (matched, mis-matched)
         tasks = [data_args.task_name]
         predict_datasets = [predict_dataset]
+
+        # if len(train_dataset['idx']) > 100000:
+        #     train_dataset = train_dataset.select(range(100000))
+        # predict_train_outputs, train_hidden_states = trainer.predict(train_dataset,
+        #                                       metric_key_prefix="train")
+        # train_hidden_states = train_hidden_states.cpu().detach().numpy()
+        # # print(len(train_dataset["sentence"]))
+        # # print(len(predict_train_outputs.predictions))
+ 
+        # extract_embedding(training_args, data_args, trainer, label_list, predict_train_outputs.predictions, train_dataset, predict_train_outputs.label_ids, train_hidden_states, predict_train_file=True)
+
         if data_args.task_name == "mnli":
             tasks.append("mnli-mm")
             predict_datasets.append(raw_datasets["validation_mismatched"])
@@ -955,26 +1177,54 @@ def main():
         for predict_dataset, task in zip(predict_datasets, tasks):
             # Removing the `label` columns because it contains -1 and Trainer won't like that.
             # predict_dataset = predict_dataset.remove_columns("label")
-            predict_outputs = trainer.predict(predict_dataset,
+            # if len(predict_dataset['idx']) > 3000:
+            #     predict_dataset = predict_dataset.select(range(3000))
+            predict_outputs, hidden_states = trainer.predict(predict_dataset,
                                               metric_key_prefix="test")
+
+            # hidden_states = hidden_states.cpu().detach().numpy()
+
             metrics = predict_outputs.metrics
             trainer.log_metrics("test", metrics)
             trainer.log(metrics)
+            # Rational.export_evolution_graphs(path=os.path.join('./logs/images/input_dist',training_args.run_name))
 
             # predictions = predict_outputs.predictions
+            # true_labels = predict_outputs.label_ids
+            # print('true_labels', true_labels)
+            # print(label)
             # predictions = np.squeeze(predictions) if is_regression else np.argmax(predictions, axis=1)
 
-            # output_predict_file = os.path.join(training_args.output_dir, f"predict_results_{task}.txt")
-            # if trainer.is_world_process_zero():
-            #     with open(output_predict_file, "w") as writer:
-            #         logger.info(f"***** Predict results {task} *****")
-            #         writer.write("index\tprediction\n")
-            #         for index, item in enumerate(predictions):
-            #             if is_regression:
-            #                 writer.write(f"{index}\t{item:3.3f}\n")
-            #             else:
-            #                 item = label_list[item]
-            #                 writer.write(f"{index}\t{item}\n")
+            # print('predict_dataset', predict_dataset)
+            # exit()
+            
+            # extract_embedding(training_args, data_args, trainer, label_list, predictions, predict_dataset, true_labels, hidden_states, task=task)
+            
+            # output_predict_file = os.path.join(training_args.output_dir, f"predict_results_{task}_{training_args.name_suffix}.txt")
+            # with open(output_predict_file, "w") as writer:
+            #     logger.info(f"***** Predict results {task} *****")
+            #     # if task_to_keys[data_args.task_name][1] is not None:
+            #     #     writer.write("index$#$prediction$#$true$#$example1$#$example2$#$embedding\n")
+            #     # else:
+            #     writer.write("index$#$prediction$#$true$#$embedding\n")
+                
+            #     for index, item in enumerate(predictions):
+            #         if is_regression:
+            #             writer.write(f"{index}\t{item:3.3f}\n")
+            #         else:
+            #             predict_label = label_list[item]
+            #             true_label = label_list[true_labels[index]]
+            #             # for sent in task_to_keys[data_args.task_name]:
+            #             #     if sent is not None:
+            #             #         example = predict_dataset[sent][index]
+            #             #         examples.append(example)
+
+            #             # examples = predict_dataset['sentence2'][index]
+            #             embedding = " ".join(map(str, hidden_states[index]))
+            #             # task_examples = "$#$".join(examples)
+            #             # writer2.write(embedding \n)
+            #             # example2 = predict_dataset['hypothesis'][index]
+            #             writer.write(f"{index}$#${predict_label}$#${true_label}$#${str(embedding)}\n")
 
     kwargs = {
         "finetuned_from": model_args.model_name_or_path,
@@ -995,6 +1245,46 @@ def main():
 def _mp_fn(index):
     # For xla_spawn (TPUs)
     main()
+
+def extract_embedding(training_args, data_args, trainer, label_list, predictions, predict_dataset, true_labels, hidden_states, predict_train_file=False, task=None):
+    if predict_train_file:
+        output_predict_folder = os.path.join(training_args.output_dir, 'train', training_args.name_suffix + f"_{task}")
+    else:
+        output_predict_folder = os.path.join(training_args.output_dir, 'test', training_args.name_suffix +f"_{task}")
+    
+    if not os.path.exists(output_predict_folder):
+        os.makedirs(output_predict_folder)
+
+    embedding_file = os.path.join(output_predict_folder, 'embeddings.txt')
+    entities_file = os.path.join(output_predict_folder, 'entities.txt')
+    label_file = os.path.join(training_args.output_dir, 'labels.txt')
+
+    if trainer.is_world_process_zero():
+        embed_writer = open(embedding_file,'w') 
+        entities_writer = open(entities_file,'w')
+        with open(label_file, 'w') as f:
+            for label in label_list:
+                f.write(label+"\n")
+        # print(len(predict_dataset['sentence']))
+        # print(len(predictions))
+        for index, item in enumerate(predictions):
+            # examples = []
+            # for sent in task_to_keys[data_args.task_name]:
+            #     if sent is not None:
+             
+            #         example = predict_dataset[sent][index]
+            #         examples.append(example)
+            # example = ";".join(examples)
+            true_label = label_list[true_labels[index]]
+            entities_writer.write(f"{index}\t{true_label}\n")
+            embedding = " ".join(map(str, hidden_states[index]))
+            embed_writer.write(f"{embedding}\n")
+            # if predict_train_file and index >= 3000:
+            #     break
+            # elif (not predict_train_file) and index >=1000:
+            #     break
+    entities_writer.close()
+    embed_writer.close()
 
 
 if __name__ == "__main__":

@@ -16,12 +16,14 @@ def parameters_to_prune(model, model_type):
             (layer.attention.self.query, 'weight'),
             (layer.attention.self.value, 'weight'),
             (layer.attention.output.dense, 'weight'),
-            (layer.intermediate.dense, 'weight'),
+            (layer.intermediate.dense_act, 'weight'),
             (layer.output.dense, 'weight')]
         pruned_parameters.extend(params)
-
-    pruned_parameters.append((model.classifier.dense,'weight'))
-    pruned_parameters.append((model.classifier.out_proj,'weight'))
+    # (layer.intermediate.dense, 'weight'),
+    # pruned_parameters.append((model.classifier.dense,'weight'))
+    pruned_parameters.append((model.classifier,'weight'))
+    # pruned_parameters.append((model.classifier.out_proj,'weight'))
+    pruned_parameters.append((model.bert.pooler.dense_act, 'weight'))
     return pruned_parameters
     # prune.global_unstructured(
     #     pruned_parameters,
@@ -54,8 +56,11 @@ def get_zero_rate(model, model_type):
         pruned_details['att_output'].append(attoutput_zero/attoutput_all)
         
         
-        int_dense_all = float(layer.intermediate.dense.weight_mask.nelement())
-        int_dense_zero = float(torch.sum(layer.intermediate.dense.weight_mask == 0))
+        # int_dense_all = float(layer.intermediate.dense.weight_mask.nelement())
+        # int_dense_zero = float(torch.sum(layer.intermediate.dense.weight_mask == 0))
+        int_dense_all = float(layer.intermediate.dense_act.weight_mask.nelement())
+        int_dense_zero = float(torch.sum(layer.intermediate.dense_act.weight_mask == 0))
+
         pruned_details['int_dense'].append(int_dense_zero/int_dense_all)
 
         output_dense_all = float(layer.output.dense.weight_mask.nelement())
@@ -71,35 +76,43 @@ def get_zero_rate(model, model_type):
         
         
     
-    cls_dense_all = float(model.classifier.dense.weight_mask.nelement())
+    # cls_dense_all = float(model.classifier.dense.weight_mask.nelement())
+    cls_dense_all = float(model.classifier.weight_mask.nelement())
     sumlist += cls_dense_all
-    cls_dense_zero = float(torch.sum(model.classifier.dense.weight_mask == 0))
+    # cls_dense_zero = float(torch.sum(model.classifier.dense.weight_mask == 0))
+    cls_dense_zero = float(torch.sum(model.classifier.weight_mask == 0))
     zerosum += cls_dense_zero
     pruned_details['cls_dense'].extend([cls_dense_zero/cls_dense_all]*len(pruned_details['avg']))
 
-    out_proj_all = float(model.classifier.out_proj.weight_mask.nelement())
+    # out_proj_all = float(model.classifier.out_proj.weight_mask.nelement())
+    out_proj_all = float(model.bert.pooler.dense_act.weight_mask.nelement())
+
     sumlist += out_proj_all
-    out_proj_zero = float(torch.sum(model.classifier.out_proj.weight_mask == 0))
+    # out_proj_zero = float(torch.sum(model.classifier.out_proj.weight_mask == 0))
+    out_proj_zero = float(torch.sum(model.bert.pooler.dense_act.weight_mask == 0))
     zerosum += out_proj_zero
     pruned_details['out_proj'].extend([out_proj_zero/out_proj_all]*len(pruned_details['avg']))
     pruned_details = pd.DataFrame.from_dict(pruned_details)
     return 100*zerosum / sumlist, pruned_details
 
 
-def original_params(model):
+def original_params(model, model_type):
     recover_dict = {}
     name_list = []
     ii = 0
 
     for ii in range(12):
-        name_list.append('roberta.encoder.layer.'+str(ii)+'.attention.self.query.weight')
-        name_list.append('roberta.encoder.layer.'+str(ii)+'.attention.self.key.weight')
-        name_list.append('roberta.encoder.layer.'+str(ii)+'.attention.self.value.weight')
-        name_list.append('roberta.encoder.layer.'+str(ii)+'.attention.output.dense.weight')
-        name_list.append('roberta.encoder.layer.'+str(ii)+'.intermediate.dense.weight')
-        name_list.append('roberta.encoder.layer.'+str(ii)+'.output.dense.weight')
-    name_list.append('classifier.dense.weight')
-    name_list.append('classifier.out_proj.weight')
+        name_list.append(f'{model_type}.encoder.layer.'+str(ii)+'.attention.self.query.weight')
+        name_list.append(f'{model_type}.encoder.layer.'+str(ii)+'.attention.self.key.weight')
+        name_list.append(f'{model_type}.encoder.layer.'+str(ii)+'.attention.self.value.weight')
+        name_list.append(f'{model_type}.encoder.layer.'+str(ii)+'.attention.output.dense.weight')
+        name_list.append(f'{model_type}.encoder.layer.'+str(ii)+'.intermediate.dense_act.weight')
+        # name_list.append(f'{model_type}.encoder.layer.'+str(ii)+'.intermediate.dense.weight')
+        name_list.append(f'{model_type}.encoder.layer.'+str(ii)+'.output.dense.weight')
+    # name_list.append('classifier.dense.weight')
+    name_list.append('classifier.weight')
+    name_list.append('bert.pooler.dense_act.weight')
+    # name_list.append('classifier.out_proj.weight')
         
     for key, value in model.named_parameters():
 
