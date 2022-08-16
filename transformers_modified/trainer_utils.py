@@ -82,6 +82,7 @@ class EvalLoopOutput(NamedTuple):
     label_ids: Optional[Union[np.ndarray, Tuple[np.ndarray]]]
     metrics: Optional[Dict[str, float]]
     num_samples: Optional[int]
+    hidden_states: Optional[np.ndarray]
 
 
 class PredictionOutput(NamedTuple):

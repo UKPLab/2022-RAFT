@@ -357,14 +357,14 @@ class RobertaAttention(nn.Module):
 class RobertaIntermediate(nn.Module):
     def __init__(self, config, use_rational, tb_writer, layer_i):
         super().__init__()
-        self.add_ln = config.add_ln
+        # self.add_ln = config.add_ln
         self.tb_writer = tb_writer
         self.logging_steps = config.logging_steps
         self.layer_i = layer_i
         self.step = 0
         self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
-        if self.add_ln:
-            self.LayerNorm = nn.LayerNorm(config.intermediate_size, eps=config.layer_norm_eps)
+        # if self.add_ln:
+        #     self.LayerNorm = nn.LayerNorm(config.intermediate_size, eps=config.layer_norm_eps)
         if isinstance(config.hidden_act, str):
             if use_rational:
                 self.intermediate_act_fn = Rational(approx_func=config.approx_func, trainable=True, version='A',cuda=True)
@@ -390,8 +390,8 @@ class RobertaIntermediate(nn.Module):
         # print('in between', len(hidden_states[torch.logical_and(hidden_states<3, hidden_states>-3)]))
         # print('smaller than -3', len(hidden_states[hidden_states<-3]))
         # hidden_states[hidden_states<-3] = 0
-        if self.add_ln:
-            hidden_states = self.LayerNorm(hidden_states)
+        # if self.add_ln:
+        #     hidden_states = self.LayerNorm(hidden_states)
  
         hidden_states = self.intermediate_act_fn(hidden_states)
 
@@ -608,7 +608,10 @@ class RobertaPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.activation = nn.Tanh()
+        if 'pooler' in config.rational_layers:
+            self.activation = Rational(config.approx_func)
+        else:
+            self.activation = nn.Tanh()
 
     def forward(self, hidden_states):
         # We "pool" the model by simply taking the hidden state corresponding

@@ -40,10 +40,10 @@ from torch.nn import CrossEntropyLoss, Module
 from torch.nn.modules.loss import MSELoss
 from torch.nn.parameter import Parameter
 from torch.utils import checkpoint
-from transformers_modified import BertConfig, PreTrainedModel
-from transformers_modified.modeling_outputs import SequenceClassifierOutput
+from . import BertConfig, PreTrainedModel
+from .modeling_outputs import SequenceClassifierOutput
 from rational.torch import Rational 
-from transformers_modified.modeling_outputs import QuestionAnsweringModelOutput
+from .modeling_outputs import QuestionAnsweringModelOutput
 
 logger = logging.getLogger(__name__)
 
@@ -244,7 +244,8 @@ def get_apex_layer_norm():
         # apex.amp.register_float_function(apex.normalization.FusedLayerNorm, 'forward')
         return apex.normalization.FusedLayerNorm
     except ImportError:
-        raise Exception(f"Layer norm of type apex is not available, apex not installed.")
+        pass
+        # raise Exception(f"Layer norm of type apex is not available, apex not installed.")
 
 
 class RMSNorm(torch.nn.Module):
@@ -503,7 +504,7 @@ class BertLayer(nn.Module):
         else:
             return hidden_states
 
-    def forward(self, hidden_states, attention_mask, action=1, keep_prob=1.0):
+    def forward(self, hidden_states, attention_mask, action=1, keep_prob=1.0, zero_out=False):
         attention_probs = None
         intermediate_input = None
 
@@ -533,24 +534,29 @@ class BertLayer(nn.Module):
             intermediate_pre_ffn = self.maybe_layer_norm(
                 intermediate_input, self.PostAttentionLayerNorm, "pre-ln"
             )
-            intermediate_output = self.intermediate(intermediate_pre_ffn)
+            if not zero_out:
+                # print('no zero out...')
+                intermediate_output = self.intermediate(intermediate_pre_ffn)
+                layer_output = self.output(intermediate_output)
+                layer_output = layer_output * 1 / keep_prob
 
-            layer_output = self.output(intermediate_output)
-            layer_output = layer_output * 1 / keep_prob
-
-            
-            if self.config.use_deepnet:
-                layer_output = deepnorm(intermediate_input, layer_output)
+            # inter_output = abs(layer_output)
+                if self.config.use_deepnet:
+                    layer_output = deepnorm(intermediate_input, layer_output)
+                else:
+                    layer_output = layer_output + intermediate_input
             else:
-                layer_output = layer_output + intermediate_input
-
+                print('zero out...')
+                layer_output = intermediate_input*(2*12)**0.25
+            
             layer_output = self.maybe_layer_norm(
                 layer_output, self.PostAttentionLayerNorm, "post-ln"
             )
-
+            # assert inter_output!= layer_output
         output = (
             layer_output,
             attention_probs,
+            # torch.mean(inter_output)
         )
         return output
 
@@ -613,12 +619,13 @@ class BertEncoder(nn.Module):
         self,
         hidden_states,
         attention_mask,
-        output_all_encoded_layers=True,
+        output_all_encoded_layers=False,
         checkpoint_activations=False,
         output_attentions=False,
     ):
         all_encoder_layers = []
         all_attentions = []
+        all_inter_output = None
 
         def custom(start, end):
             def custom_forward(*inputs):
@@ -641,7 +648,7 @@ class BertEncoder(nn.Module):
                 l += chunk_length
             # decoder layers
         else:
-            for layer_module in self.layer:
+            for ix, layer_module in enumerate(self.layer):
                 if self.is_transformer_kernel:
                     # using Deepspeed Transformer kernel
                     hidden_states = layer_module(hidden_states, attention_mask)
@@ -649,15 +656,19 @@ class BertEncoder(nn.Module):
                     layer_out = layer_module(
                         hidden_states,
                         attention_mask,
+                        # zero_out= (ix==8) or (ix==9) or (ix==10)
                     )
+                    # hidden_states, attention_probs, inter_output = layer_out
                     hidden_states, attention_probs = layer_out
+
                     # get all attention_probs from layers
                     if output_attentions:
                         all_attentions = self.add_attention(all_attentions, attention_probs)
 
                 if output_all_encoded_layers:
                     all_encoder_layers.append(hidden_states)
-
+                # inter_output = inter_output.view(-1,)
+                # all_inter_output = inter_output if all_inter_output is None else torch.cat([all_inter_output, inter_output])
         if not output_all_encoded_layers or checkpoint_activations:
             if self.config.useLN and self.config.encoder_ln_mode in "pre-ln":
                 hidden_states = self.FinalLayerNorm(hidden_states)
@@ -666,6 +677,8 @@ class BertEncoder(nn.Module):
         outputs = (all_encoder_layers,)
         if output_attentions:
             outputs += (all_attentions,)
+        # print('aa', all_inter_output)
+        # outputs += (all_inter_output,)
         return outputs
 
 
@@ -870,7 +883,7 @@ class BertModel(BertPreTrainedModel):
         input_ids,
         token_type_ids=None,
         attention_mask=None,
-        output_all_encoded_layers=True,
+        output_all_encoded_layers=False,
         checkpoint_activations=False,
         output_attentions=False,
     ):
@@ -918,7 +931,13 @@ class BertModel(BertPreTrainedModel):
             pooled_output,
         )
         if output_attentions:
-            output += (encoder_output[-1],)
+            output += (encoder_output[1],)
+        # # output of intermeidate
+        # if pooled_output is not None:
+        #     intermediate = torch.cat([encoder_output[-1], torch.mean(abs(pooled_output)).view(-1,)])
+        # else:
+        #     intermediate = None
+        # output += (intermediate,)
         return output
 
 
@@ -1285,7 +1304,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
         return SequenceClassifierOutput(
             loss=loss,
             logits=logits,
-            hidden_states=None,
+            hidden_states=outputs[0],
             attentions=None,
         )
 
@@ -1297,7 +1316,6 @@ class BertForQuestionAnswering(BertPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-
         self.bert = BertModel(config, add_pooling_layer=False)
         self.qa_outputs = nn.Linear(config.hidden_size, config.num_labels)
 

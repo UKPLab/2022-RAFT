@@ -86,7 +86,6 @@ def get_raw_scores(examples, preds):
     """
     exact_scores = {}
     f1_scores = {}
-
     for example in examples:
         qas_id = example.qas_id
         gold_answers = [answer["text"] for answer in example.answers if normalize_answer(answer["text"])]
@@ -433,6 +432,7 @@ def compute_predictions_logits(
             result = unique_id_to_result[feature.unique_id]
             start_indexes = _get_best_indexes(result.start_logits, n_best_size)
             end_indexes = _get_best_indexes(result.end_logits, n_best_size)
+
             # if we could have irrelevant answers, get the min score of irrelevant
             if version_2_with_negative:
                 feature_null_score = result.start_logits[0] + result.end_logits[0]
@@ -480,6 +480,7 @@ def compute_predictions_logits(
                     end_logit=null_end_logit,
                 )
             )
+        # print('prelim_predictions',prelim_predictions)
         prelim_predictions = sorted(prelim_predictions, key=lambda x: (x.start_logit + x.end_logit), reverse=True)
 
         _NbestPrediction = collections.namedtuple(  # pylint: disable=invalid-name

@@ -193,7 +193,7 @@ OPTIMIZER_NAME = "optimizer.pt"
 SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
 
-
+# torch.autograd.set_detect_anomaly(True) 
 class Trainer:
     """
     Trainer is a simple but feature-complete training and eval loop for PyTorch, optimized for 🤗 Transformers.
@@ -429,6 +429,7 @@ class Trainer:
         self.use_amp = False
 
         if args.fp16 or args.bf16:
+            self.scale_counter_at_1 = 0
             if args.half_precision_backend == "auto":
                 if _is_native_amp_available:
                     args.half_precision_backend = "amp"
@@ -638,11 +639,9 @@ class Trainer:
         """
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
-
         train_dataset = self.train_dataset
         if is_datasets_available() and isinstance(train_dataset, datasets.Dataset):
             train_dataset = self._remove_unused_columns(train_dataset, description="training")
-
         if isinstance(train_dataset, torch.utils.data.IterableDataset):
             if self.args.world_size > 1:
                 train_dataset = IterableDatasetShard(
@@ -1361,9 +1360,14 @@ class Trainer:
                 ):
                     # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
                     with model.no_sync():
-                        tr_loss_step = self.training_step(model, inputs)
+                        tr_loss_step, is_break = self.training_step(model, inputs)
                 else:
-                    tr_loss_step = self.training_step(model, inputs)
+                    tr_loss_step, is_break = self.training_step(model, inputs)
+                if is_break:
+                    logger.info("Optimizer scale==1 counter has been reached, SKIP this batch...")
+                    del inputs
+                    del tr_loss_step
+                    continue
 
                 if (
                     args.logging_nan_inf_filter
@@ -1939,7 +1943,7 @@ class Trainer:
         """
         model.train()
         inputs = self._prepare_inputs(inputs)
-
+        is_break = False
         if is_sagemaker_mp_enabled():
             scaler = self.scaler if self.do_grad_scaling else None
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps, scaler=scaler)
@@ -1947,12 +1951,23 @@ class Trainer:
 
         with self.autocast_smart_context_manager():
             # start = time.time()
-            loss = self.compute_loss(model, inputs)
+            loss,output = self.compute_loss(model, inputs,return_outputs=True)
             # end = time.time()
             # print('compute loss', end-start)
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
+        if self.args.fp16:
+            if self.state.global_step > 650 and self.args.deepspeed and hasattr(self.optimizer, 'cur_scale'):
+                print('optmizer curscale', self.optimizer.cur_scale)
+            if (self.args.fp16 or self.args.bf16) and hasattr(self.optimizer, 'cur_scale') and self.optimizer.cur_scale == 1:
+                self.scale_counter_at_1 += 1
+                logger.info(f"Optimizer scale reach one {self.scale_counter_at_1} times")
 
+            if self.scale_counter_at_1 >= self.args.scale_cnt_limit:
+                self.scale_counter_at_1 = 0
+                is_break =True
+                return loss, is_break
+                        
         if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
             # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
             loss = loss / self.args.gradient_accumulation_steps
@@ -1966,12 +1981,10 @@ class Trainer:
             # loss gets scaled under gradient_accumulation_steps in deepspeed
             loss = self.deepspeed.backward(loss)
         else:
-            # start = time.time()
             loss.backward()
-            # end = time.time()
-            # print('loss backward time', end-start)
 
-        return loss.detach()
+
+        return loss.detach(), is_break
 
     def compute_loss(self, model, inputs, return_outputs=False):
         """
@@ -2310,7 +2323,7 @@ class Trainer:
 
         self._memory_tracker.stop_and_update_metrics(output.metrics)
 
-        return PredictionOutput(predictions=output.predictions, label_ids=output.label_ids, metrics=output.metrics)
+        return PredictionOutput(predictions=output.predictions, label_ids=output.label_ids, metrics=output.metrics), output.hidden_states
 
     def evaluation_loop(
         self,
@@ -2395,13 +2408,16 @@ class Trainer:
                     batch_size = observed_batch_size
 
             # Prediction step
-            loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
-            # select argmax
+            loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys) 
             if len(logits.size()) == 3:
                 logits = torch.argmax(logits, axis = -1)
+
             if is_torch_tpu_available():
                 xm.mark_step()
-
+            
+            # print('pred', len(logits_test))
+            # print('labels', len(labels_test))
+            # assert len(logits_test)== len(labels_test)
             # Update containers on host
             if loss is not None:
                 losses = self._nested_gather(loss.repeat(batch_size))
@@ -2410,7 +2426,6 @@ class Trainer:
                 logits = self._pad_across_processes(logits)
                 logits = self._nested_gather(logits)
                 preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
-
 
             if labels is not None:
                 labels = self._pad_across_processes(labels)
@@ -2612,7 +2627,10 @@ class Trainer:
                     loss = loss.mean().detach()
 
                     if isinstance(outputs, dict):
-                        logits = tuple(v for k, v in outputs.items() if k not in ignore_keys + ["loss"])
+                        logits = tuple(v for k, v in outputs.items() if k not in ignore_keys + ["loss","hidden_states"])
+                        # hidden_states = outputs['hidden_states']
+                        # print(outputs)
+                        # exit()
                     else:
                         logits = outputs[1:]
                 else:

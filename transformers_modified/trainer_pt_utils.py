@@ -800,7 +800,7 @@ def _get_learning_rate(self):
         # not run for the first few dozen steps while loss scale is too large, and thus during
         # that time `get_last_lr` will fail if called during that warm up stage, so work around it:
         try:
-            last_lr = self.lr_scheduler.get_last_lr()[0]
+            last_lr = self.lr_scheduler.get_last_lr()
         except AssertionError as e:
             if "need to call step" in str(e):
                 logger.warning("tried to get lr value before scheduler/optimizer started stepping, returning lr=0")
