@@ -607,40 +607,7 @@ def main():
     config.logging_steps = training_args.logging_steps
     config.tb_dir = data_args.tb_dir
 
-    if training_args.optimizer.lower() == 'recadam' or training_args.do_mix:
-
-        # initialise from scratch
-        model = AutoModelForSequenceClassification.from_config(config)
-        #
-        config.rational_layers = ['']
-        config.add_ln = False
-        pretrained_model = AutoModelForSequenceClassification.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
-        pretrained_model.to(training_args.device)
-        if training_args.do_mix:
-            pretrained_weights = pretrained_model.state_dict()
-            replaced_layers = model_args.pretrained_layers.split(',')
-            pretrained_layers = []
-            for layer in replaced_layers:
-                if '-' in layer:
-                    layers = layer.split('-')
-                    pretrained_layers.extend([str(i) for i in range(int(layers[0]), int(layers[1])+1)])
-                else:
-                    pretrained_layers.append(layer)
-            pretrained_layers.append('embedding')
-            replaced_weights = {k:v for k, v in pretrained_weights.items() for ly in pretrained_layers if ly in k}
-            model_dict = model.state_dict()
-            model_dict.update(replaced_weights)
-            model.load_state_dict(model_dict)
-            # add rational for random initialised model
-
-    elif model_args.academicBERT:
+    if model_args.academicBERT:
         model = BertForSequenceClassification.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
@@ -658,13 +625,7 @@ def main():
             use_auth_token=True if model_args.use_auth_token else None,
         )
 
-    print('rational functions', Rational.list)
-    if training_args.save_rational_functions:
-        file_path = os.path.join('./pkl_files', 'full_data_' + data_args.task_name + '_' + str(training_args.seed)+ '.pkl')
-        # file_path = os.path.join('./pkl_files',  'pretrained_' + str(training_args.seed)+ '.pkl')
-        with open(file_path,'wb') as f:
-            pickle.dump(Rational.list,f)
-        exit()
+
 
     # Preprocessing the raw_datasets
     if data_args.task_name is not None:
@@ -813,7 +774,7 @@ def main():
             f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
         )
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
-    print('max length',max_seq_length)
+
     def preprocess_function(examples):
         # Tokenize the texts
         args = ((examples[sentence1_key], ) if sentence2_key is None else
@@ -862,9 +823,6 @@ def main():
             eval_ixs = random.sample(range(len(eval_dataset['idx'])), data_args.max_eval_samples)
             eval_dataset = eval_dataset.select(eval_ixs)
 
-        # else:
-        #     eval_dataset = raw_datasets["validation_matched" if data_args.
-        #                                 task_name == "mnli" else "validation"]
 
     if training_args.do_predict or data_args.task_name is not None or data_args.test_file is not None:
 
@@ -995,9 +953,6 @@ def main():
         tasks = [data_args.task_name]
         predict_datasets = [predict_dataset]
 
-
-        # extract_embedding(training_args, data_args, trainer, label_list, predict_train_outputs.predictions, train_dataset, predict_train_outputs.label_ids, train_hidden_states, predict_train_file=True)
-
         if data_args.task_name == "mnli":
             tasks.append("mnli-mm")
             predict_datasets.append(raw_datasets["validation_mismatched"])
@@ -1015,37 +970,7 @@ def main():
             trainer.log(metrics)
             # Rational.export_evolution_graphs(path=os.path.join('./logs/images/input_dist',training_args.run_name))
 
-            # predictions = predict_outputs.predictions
-            # true_labels = predict_outputs.label_ids
-            # print('true_labels', true_labels)
-            # print(label)
-            # predictions = np.squeeze(predictions) if is_regression else np.argmax(predictions, axis=1)
 
-            # output_predict_file = os.path.join(training_args.output_dir, f"predict_results_{task}_{training_args.name_suffix}.txt")
-            # with open(output_predict_file, "w") as writer:
-            #     logger.info(f"***** Predict results {task} *****")
-            #     # if task_to_keys[data_args.task_name][1] is not None:
-            #     #     writer.write("index$#$prediction$#$true$#$example1$#$example2$#$embedding\n")
-            #     # else:
-            #     writer.write("index$#$prediction$#$true$#$embedding\n")
-                
-            #     for index, item in enumerate(predictions):
-            #         if is_regression:
-            #             writer.write(f"{index}\t{item:3.3f}\n")
-            #         else:
-            #             predict_label = label_list[item]
-            #             true_label = label_list[true_labels[index]]
-            #             # for sent in task_to_keys[data_args.task_name]:
-            #             #     if sent is not None:
-            #             #         example = predict_dataset[sent][index]
-            #             #         examples.append(example)
-
-            #             # examples = predict_dataset['sentence2'][index]
-            #             embedding = " ".join(map(str, hidden_states[index]))
-            #             # task_examples = "$#$".join(examples)
-            #             # writer2.write(embedding \n)
-            #             # example2 = predict_dataset['hypothesis'][index]
-            #             writer.write(f"{index}$#${predict_label}$#${true_label}$#${str(embedding)}\n")
 
     kwargs = {
         "finetuned_from": model_args.model_name_or_path,
