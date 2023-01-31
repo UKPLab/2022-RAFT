@@ -17,9 +17,16 @@ sns.set_style("whitegrid")
 
 
 
-def plot_layers_per_task(file_folder, save_folder, selection= [0,1,5,10,11], subplots=None, plot_size=None):
-    for file in os.listdir(file_folder):
-        filepath = os.path.join(file_folder, file)
+def plot_layers_per_task(files, save_folder, selection= [0,1,5,10,11], subplots=None, plot_size=None):
+    if os.path.isdir(files):
+        files_list = os.listdir(files)
+    else:
+        files_list = [files]
+    for file in files_list:
+        if os.path.isdir(files):
+            filepath = os.path.join(files, file)
+        else:
+            filepath = file
 
         Rational.list = pickle.load(open(filepath, "rb"))
 
@@ -47,7 +54,7 @@ def plot_layers_per_task(file_folder, save_folder, selection= [0,1,5,10,11], sub
             if not plot_size:
                 ax.legend()
             ax.set_title(f"layer {rat_n+1}", fontsize=10)
-            save_path = os.path.join(save_folder, task+'.svg')
+            save_path = os.path.join(save_folder, task+'.pdf')
             plt.savefig(save_path, bbox_inches='tight')
         # plt.title("")
             # else:
