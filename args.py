@@ -125,12 +125,6 @@ class CustomTrainingArguments(TrainingArguments):
 
     optimizer: Optional[str] = field(default="adam", metadata={"help":"whether to use RecAdam"})
 
-    recadam_anneal_w: Optional[float] = field(default=1.0, metadata={"help":"Weight for the annealing function in RecAdam. Default 1.0."})
-    recadam_anneal_fun: Optional[str] = field(default='sigmoid', metadata={"help":"the type of annealing function in RecAdam. Default sigmoid"})
-
-    recadam_anneal_k: Optional[float] = field(default=0.5, metadata={"help":"k for the annealing function in RecAdam."})                    
-    recadam_anneal_t0: Optional[int] = field(default=250, metadata={"help":"t0 for the annealing function in RecAdam."})
-    recadam_pretrain_cof: Optional[float] = field(default=5000.0, metadata={"help":"tCoefficient of the quadratic penalty in RecAdam. Default 5000.0."})
     predict_train_file: bool = False
 
 @dataclass
@@ -175,7 +169,7 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
-
+    load_from_disk: bool = True
     task_name: str = field(
     default=None,
     metadata={

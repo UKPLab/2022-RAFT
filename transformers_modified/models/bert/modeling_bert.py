@@ -640,15 +640,7 @@ class BertEncoder(nn.Module):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
-        # print('status',self.training)
-        # if not self.training:
-        #     model_name = 'original' if self.config.rational_layers == [''] else 'rational_'+",".join(self.config.rational_layers)
-        #     save_dir = f'/ukp-storage-1/fang/BERT-Tickets-master/logs/weights/{model_name}'
-        #     if not os.path.exists(save_dir):
-        #         os.makedirs(save_dir)
-        #     save_path  = os.path.join(save_dir, f'layer_output_{self.counter}.pt')
-        #     torch.save(output_dic, save_path)
-        #     self.counter += 1
+
         
         if not return_dict:
             return tuple(

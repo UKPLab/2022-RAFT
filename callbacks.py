@@ -43,22 +43,23 @@ class CustomWandbCallback(WandbCallback):
     #         if state.global_step % args.logging_steps == 0:
     #             Rational.save_all_inputs(True)
     # def on_step_end(self, args: CustomTrainingArguments, state, control, **kwargs):
-    #     if state.global_step % args.save_steps==0:
-    #         print('true......')
+    #     # if state.global_step % args.save_steps==0:
+    #     #     print('true......')
 
-    #         image_dir  = os.path.join(self.normal_image_dir, args.run_name)
-    #         if not os.path.exists(image_dir):
-    #             os.mkdir(image_dir)
-    #         filename = os.path.join(image_dir, f"{args.approx_func}_RF_step_{state.global_step}.jpg")
-    #         Rational.capture_all(name = "RF")
-    #         Rational.export_graphs(path = filename)
+    #     image_dir  = os.path.join(self.normal_image_dir, args.run_name)
+    #     if not os.path.exists(image_dir):
+    #         os.mkdir(image_dir)
+    #     filename = os.path.join(image_dir, f"{args.approx_func}_RF_step_{state.global_step}.jpg")
+    #     Rational.capture_all(name = "RF")
+    #     Rational.export_graphs(path = filename)
+    #     exit()
 
-    def on_epoch_end(
-        self, args:CustomTrainingArguments, state, control, **kwargs
-    ):
-        if args.save_rational_plots and len(Rational.list) > 0:
-            Rational.capture_all(f"Global Step {state.global_step}")
-            Rational.save_all_inputs(True)
+    # def on_epoch_end(
+    #     self, args:CustomTrainingArguments, state, control, **kwargs
+    # ):
+    #     if args.save_rational_plots and len(Rational.list) > 0:
+    #         Rational.capture_all(f"Global Step {state.global_step}")
+            # Rational.save_all_inputs(True)
             # filename = f"{args.output_dir}/ra_{state.global_step}.png"
             # Rational.export_graphs(filename)
             # self._wandb.log(

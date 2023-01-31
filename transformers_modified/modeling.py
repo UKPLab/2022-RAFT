@@ -155,7 +155,7 @@ class LinearActivation(Module):
     r"""Fused Linear and activation Module."""
     __constants__ = ["bias"]
 
-    def __init__(self, in_features, out_features, act="gelu", bias=True, use_deepnet=False):
+    def __init__(self, in_features, out_features, act="gelu", bias=True, use_deepnet=False, approx_func="gelu"):
         super(LinearActivation, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -163,9 +163,7 @@ class LinearActivation(Module):
         self.fused_tanh = False
         self.fused_relu = False
         self.use_deepnet = use_deepnet
-        # apex_ln = get_apex_layer_norm()
-        # self.ln = apex_ln(out_features, eps=1e-12)
-        # self.ln = nn.LayerNorm(in_features)
+
         if isinstance(act, str) or (sys.version_info[0] == 2 and isinstance(act, unicode)):
             if bias and act == "gelu":
                 self.fused_gelu = True
@@ -174,7 +172,7 @@ class LinearActivation(Module):
             elif bias and act == "relu":
                 self.fused_relu = True
             elif bias and act == "rational":
-                self.rf = Rational(approx_func="gelu",version="A")
+                self.rf = Rational(approx_func=approx_func, version="A")
                 self.fused_rational = True
             else:
                 self.act_fn = ACT2FN[act]
@@ -453,7 +451,7 @@ class BertIntermediate(nn.Module):
         else:
             linear_layer = RegularLinearActivation
         if use_rational:
-            self.dense_act = linear_layer(config.hidden_size, config.intermediate_size, act="rational", use_deepnet=config.use_deepnet)
+            self.dense_act = linear_layer(config.hidden_size, config.intermediate_size, act="rational", use_deepnet=config.use_deepnet, approx_func=config.approx_func)
         else:
             self.dense_act = linear_layer(
                 config.hidden_size, config.intermediate_size, act=config.hidden_act
@@ -694,7 +692,7 @@ class BertPooler(nn.Module):
             act="rational"
         else:
             act="tanh"
-        self.dense_act = linear_layer(config.hidden_size, config.hidden_size, act=act)
+        self.dense_act = linear_layer(config.hidden_size, config.hidden_size, act=act, approx_func=config.approx_func)
 
     def forward(self, hidden_states):
         # We "pool" the model by simply taking the hidden state corresponding

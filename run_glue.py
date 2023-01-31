@@ -16,10 +16,6 @@
 """ Finetuning the library models for sequence classification on GLUE."""
 # You can also adapt this script on your own text classification task. Pointers for this are left as comments.
 
-from asyncore import write
-from cProfile import label
-from doctest import Example
-from functools import reduce
 import logging
 import os
 import random
@@ -124,88 +120,6 @@ class CustomTrainer(Trainer):
         self.origin_params = origin_params
         self.masks = masks
 
-    def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch,
-                                 ignore_keys_for_eval):
-        if self.control.should_log:
-            if is_torch_tpu_available():
-                xm.mark_step()
-
-            logs: Dict[str, float] = {}
-
-            # all_gather + mean() to get average loss over all processes
-            tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
-
-            # reset tr_loss to zero
-            tr_loss -= tr_loss
-
-            logs["loss"] = round(
-                tr_loss_scalar /
-                (self.state.global_step - self._globalstep_last_logged), 4)
-            logs["learning_rate"] = self._get_learning_rate()
-
-            self._total_loss_scalar += tr_loss_scalar
-            self._globalstep_last_logged = self.state.global_step
-            self.store_flos()
-
-            self.log(logs)
-
-        metrics = None
-        if self.control.should_evaluate:
-            metrics = self.evaluate(ignore_keys=ignore_keys_for_eval)
-            self._report_to_hp_search(trial, epoch, metrics)
-
-        if self.control.should_save:
-            logger.info('start saving...')
-            self._save_checkpoint(model, trial, metrics=metrics)
-            self.control = self.callback_handler.on_save(
-                self.args, self.state, self.control)
-            if self.args.do_pruning and (epoch+1)%3 == 0:
-                logger.info('start pruning...')
-
-                logger.info(f'pruning {self.pruning_step+1}0%')
-                params = parameters_to_prune(model, self.args.model_type)
-
-                prune.global_unstructured(params,
-                                          pruning_method=prune.L1Unstructured,
-                                          amount=1 / (10 - self.pruning_step))
-
-                self.pruning_step += 1
-                if self.pruning_step == 9:
-                    self.control.should_training_stop = True
-                logger.info('rewinding...')
-                model_dict = model.state_dict()
-                model_dict.update(self.origin_params)
-                model.load_state_dict(model_dict)
-
-                rational = ['numerator', 'denominator']
-                grouped_params = [{
-                    "params": [
-                        v for k, v in model.named_parameters()
-                        if any(param in k for param in rational)
-                    ],
-                    "lr":
-                    self.args.rational_lr
-                }, {
-                    "params": [
-                        v for k, v in model.named_parameters()
-                        if not any(param in k for param in rational)
-                    ],
-                    "lr":
-                    self.args.learning_rate
-                }]
-                self.optimizer = torch.optim.Adam(grouped_params,
-                                                  lr=self.args.learning_rate)
-                self.lr_scheduler = None
-                self.lr_scheduler = self.create_scheduler(
-                    num_training_steps=self.args.save_steps,
-                    optimizer=self.optimizer)
-
-                mask_dict = {}
-                for key in model_dict.keys():
-                    if 'mask' in key:
-                        mask_dict[key] = model_dict[key]
-                self._save_mask_dict(mask_dict=mask_dict, trial=None)
-
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
@@ -269,8 +183,6 @@ class CustomTrainer(Trainer):
             # print(self.masks)
             for k, v in model.named_parameters():
                 if v.grad is not None and 'classifier' not in k:
-                # print(k)
-                # print(self.masks[k])
                     v.grad[~self.masks[k]] = 0
 
         return loss.detach(), is_break
@@ -315,10 +227,10 @@ class CustomTrainer(Trainer):
             # print('labels', inputs['labels'])
             acc = ((preds.argmax(axis=-1) == inputs["labels"]).type(
                 torch.float).mean().item())
-            if self.state.global_step % self.args.logging_steps == 0 and not self.control.should_evaluate:
-                # logger.info(f"global step {self.state.global_step}")
-                # logger.info(f"logging step {self.args.logging_steps}")
-                self.log({"train/accuarcy": acc})
+            # if self.state.global_step % self.args.logging_steps == 0 and not self.control.should_evaluate:
+            #     # logger.info(f"global step {self.state.global_step}")
+            #     # logger.info(f"logging step {self.args.logging_steps}")
+            #     self.log({"train/accuarcy": acc})
 
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
@@ -418,19 +330,7 @@ class CustomTrainer(Trainer):
 
             # Prediction step
             loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
-            #[32, 768]
-            # hidden_states = hidden_states[-1][:,0,:]
-            # print('hidden_states', hidden_states.size())
-            # exit()
-            # hidden_states = [i[:,0,:].detach().cpu().numpy() for i in hidden_states]
-            # print(hidden_states[0].shape)
-            # exit()
-            # inter_output = logits[-1]
-            # inter_output = inter_output.view(1,-1)
-            # inter_outputs = inter_output if inter_outputs is None else torch.cat([inter_outputs, inter_output], axis=0)
-            
-            # logits = logits[0]
-            # select argmax
+
             if len(logits.size()) == 3:
                 logits = torch.argmax(logits, axis = -1)
             if is_torch_tpu_available():
@@ -469,10 +369,6 @@ class CustomTrainer(Trainer):
 
                 # Set back to None to begin a new accumulation
                 losses_host, preds_host, labels_host = None, None, None
-        # inter_outputs = torch.mean(inter_outputs, axis=0)
-        # inter_contribution = torch.argsort(inter_outputs)
-        # print('contribution of each layer', inter_contribution)
-        # print('contribution value of each layer', inter_outputs)
 
         if args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of the evaluation loop
@@ -499,7 +395,7 @@ class CustomTrainer(Trainer):
             num_samples = eval_dataset.num_examples
         else:
             num_samples = observed_num_examples
-        # print('bbbb')
+
         # Number of losses has been rounded to a multiple of batch_size and in a distributed training, the number of
         # samplers has been rounded to a multiple of batch_size, so we truncate.
         if all_losses is not None:
@@ -508,13 +404,12 @@ class CustomTrainer(Trainer):
             all_preds = nested_truncate(all_preds, num_samples)
         if all_labels is not None:
             all_labels = nested_truncate(all_labels, num_samples)
-        # print('cccc')
         # Metrics!
         if self.compute_metrics is not None and all_preds is not None and all_labels is not None:
             metrics = self.compute_metrics(EvalPrediction(predictions=all_preds, label_ids=all_labels))
         else:
             metrics = {}
-        # print('dddd')
+
         # To be JSON-serializable, we need to remove numpy types or zero-d tensors
         metrics = denumpify_detensorize(metrics)
         # print('eeee')
@@ -525,11 +420,8 @@ class CustomTrainer(Trainer):
         for key in list(metrics.keys()):
             if not key.startswith(f"{metric_key_prefix}_"):
                 metrics[f"{metric_key_prefix}_{key}"] = metrics.pop(key)
-        # print('fffff')
-        # hidden_states_host = torch.cat(hidden_states_host, axis=0)
-        # print(hidden_states_host)
-        # print(hidden_states_host.size())
-        return EvalLoopOutput(predictions=all_preds, label_ids=all_labels, metrics=metrics, num_samples=num_samples, hidden_states=None)
+
+        return EvalLoopOutput(predictions=all_preds, label_ids=all_labels, metrics=metrics, num_samples=num_samples)
 
 
 def main():
@@ -660,34 +552,6 @@ def main():
         else:
             num_labels = 1
     else:
-        pass
-        # for mlm pruning
-        # column_names = raw_datasets["validation"].column_names
-        # text_column_name = "text" if "text" in column_names else column_names[0]
-
-        # with training_args.main_process_first(desc="dataset map tokenization"):
-        #     tokenized_datasets = raw_datasets.map(
-        #         tokenize_function,
-        #         batched=True,
-        #         num_proc=data_args.preprocessing_num_workers,
-        #         remove_columns=column_names,
-        #         load_from_cache_file=not data_args.overwrite_cache,
-        #         desc="Running tokenizer on every text in dataset",
-        #         cache_file_names={k:os.path.join(model_args.cache_dir, data_args.dataset_name, k+"_" + data_args.dataset_name +  model_args.tokenizer_name + "_" + str(data_args.max_seq_length) + "_"+ training_args.model_type+'.arrow') for k in raw_datasets}
-        #     )
-        
-        # cls_id = tokenizer.convert_tokens_to_ids("[CLS]")
-        # sep_id = tokenizer.convert_tokens_to_ids("[SEP]")
-        # with training_args.main_process_first(desc="grouping texts together"):
-        #     tokenized_datasets = tokenized_datasets.map(
-        #         lambda x :group_texts(x, cls_id=cls_id,sep_id=sep_id),
-        #         batched=True,
-        #         num_proc=data_args.preprocessing_num_workers,
-        #         load_from_cache_file=not data_args.overwrite_cache,
-        #         desc=f"Grouping texts in chunks of {max_seq_length}",
-        #         cache_file_names={k:os.path.join(model_args.cache_dir, data_args.dataset_name, "grouped_" + k +"_" + args.dataset_name +  model_args.tokenizer_name + "_" + str(data_args.max_seq_length) + "_"+ training_args.model_type+'.arrow') for k in raw_datasets}
-        #     )
-        #     eval_dataset = tokenized_datasets["validation"]
         
         # Trying to have good defaults here, don't hesitate to tweak to your needs.
         is_regression = raw_datasets["train"].features["label"].dtype in [
@@ -824,22 +688,10 @@ def main():
     no_decay = ["bias", "LayerNorm.weight"]
 
     
-    # head
-    # trained_weights = ["pooler", "classifier"]
-    
-    # bitfit
-    # trained_weights = ["attention.self.key.bias", "classifier"]
-     # frozen rational activation functions
 
     # used for subset bitfit
     masks = None
     if training_args.frozen_rf:
-        # uniform sample
-        # for k,v in model.named_parameters():
-        #     if 'classifier' in k:
-        #         num_tune_params += reduce(lambda x, y: x * y, v.shape)
-        # print("number of tuned params", num_tune_params)
-        # exit()
         
         for k, v in model.named_parameters():
             if any(name in k for name in rational):
@@ -908,8 +760,7 @@ def main():
         "weight_decay":
         0.0
     }]
-    # optimizer = torch.optim.Adam(grouped_params,
-                                #  lr=training_args.learning_rate)
+
     optimizer = AdamW(grouped_params, lr=training_args.learning_rate, weight_decay=training_args.weight_decay)
 
     # Padding strategy
@@ -962,7 +813,7 @@ def main():
             f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
         )
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
-
+    print('max length',max_seq_length)
     def preprocess_function(examples):
         # Tokenize the texts
         args = ((examples[sentence1_key], ) if sentence2_key is None else
@@ -1028,15 +879,7 @@ def main():
             predict_dataset = raw_datasets["validation_matched" if data_args.
                                         task_name == "mnli" else "validation"]
 
-        # if data_args.max_eval_samples is not None:
-        #     predict_dataset = predict_dataset.select(
-        #         range(data_args.max_eval_samples))
 
-        # if "test" not in raw_datasets and "test_matched" not in raw_datasets:
-        #     raise ValueError("--do_predict requires a test dataset")
-        # predict_dataset = raw_datasets["test_matched" if data_args.task_name == "mnli" else "test"]
-        # if data_args.max_predict_samples is not None:
-        #     predict_dataset = predict_dataset.select(range(data_args.max_predict_samples))
 
     # Log a few random samples from the training set:
     if training_args.do_train:
@@ -1087,7 +930,7 @@ def main():
         origin_weights = None
         callback = EarlyStoppingCallback(early_stopping_patience=training_args.patience)
     
-    # scheduler = get_scheduler(scheduler_args, optimizer, training_args)
+ 
     # Initialize our Trainer
     trainer = CustomTrainer(
         model=model,
@@ -1101,15 +944,7 @@ def main():
         origin_params=origin_weights,
         masks=masks,
         callbacks=[callback])
-    # trainer = Trainer(
-    #     model=model,
-    #     args=training_args,
-    #     train_dataset=train_dataset if training_args.do_train else None,
-    #     eval_dataset=eval_dataset if training_args.do_eval else None,
-    #     compute_metrics=compute_metrics,
-    #     tokenizer=tokenizer,
-    #     data_collator=data_collator,
-    # )
+
 
     # Training
     if training_args.do_train:
@@ -1160,14 +995,7 @@ def main():
         tasks = [data_args.task_name]
         predict_datasets = [predict_dataset]
 
-        # if len(train_dataset['idx']) > 100000:
-        #     train_dataset = train_dataset.select(range(100000))
-        # predict_train_outputs, train_hidden_states = trainer.predict(train_dataset,
-        #                                       metric_key_prefix="train")
-        # train_hidden_states = train_hidden_states.cpu().detach().numpy()
-        # # print(len(train_dataset["sentence"]))
-        # # print(len(predict_train_outputs.predictions))
- 
+
         # extract_embedding(training_args, data_args, trainer, label_list, predict_train_outputs.predictions, train_dataset, predict_train_outputs.label_ids, train_hidden_states, predict_train_file=True)
 
         if data_args.task_name == "mnli":
@@ -1176,10 +1004,8 @@ def main():
 
         for predict_dataset, task in zip(predict_datasets, tasks):
             # Removing the `label` columns because it contains -1 and Trainer won't like that.
-            # predict_dataset = predict_dataset.remove_columns("label")
-            # if len(predict_dataset['idx']) > 3000:
-            #     predict_dataset = predict_dataset.select(range(3000))
-            predict_outputs, hidden_states = trainer.predict(predict_dataset,
+
+            predict_outputs = trainer.predict(predict_dataset,
                                               metric_key_prefix="test")
 
             # hidden_states = hidden_states.cpu().detach().numpy()
@@ -1195,11 +1021,6 @@ def main():
             # print(label)
             # predictions = np.squeeze(predictions) if is_regression else np.argmax(predictions, axis=1)
 
-            # print('predict_dataset', predict_dataset)
-            # exit()
-            
-            # extract_embedding(training_args, data_args, trainer, label_list, predictions, predict_dataset, true_labels, hidden_states, task=task)
-            
             # output_predict_file = os.path.join(training_args.output_dir, f"predict_results_{task}_{training_args.name_suffix}.txt")
             # with open(output_predict_file, "w") as writer:
             #     logger.info(f"***** Predict results {task} *****")
@@ -1265,16 +1086,9 @@ def extract_embedding(training_args, data_args, trainer, label_list, predictions
         with open(label_file, 'w') as f:
             for label in label_list:
                 f.write(label+"\n")
-        # print(len(predict_dataset['sentence']))
-        # print(len(predictions))
+
         for index, item in enumerate(predictions):
-            # examples = []
-            # for sent in task_to_keys[data_args.task_name]:
-            #     if sent is not None:
-             
-            #         example = predict_dataset[sent][index]
-            #         examples.append(example)
-            # example = ";".join(examples)
+
             true_label = label_list[true_labels[index]]
             entities_writer.write(f"{index}\t{true_label}\n")
             embedding = " ".join(map(str, hidden_states[index]))
