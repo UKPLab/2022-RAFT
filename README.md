@@ -119,7 +119,7 @@ We fine-tuned our models on GLUE and SQuAD.
     - Low-data: `./scripts/finetune/bitfit/glue-<model_type>-lr-array.sh`
 
     - Full-data: `./scripts/finetune/bitfit/glue-<model_type>-array.sh`
-  - Note: <model-type> could be raft or vanilla.   
+  - Note: `<model-type>` could be raft or vanilla.   
     
 
 ### Zero-shot learning
