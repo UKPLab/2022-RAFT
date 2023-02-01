@@ -27,6 +27,7 @@ This repository incldues code and model for our EACL 2023 findings paper: [Trans
  ```python
 pip install -r requirements.txt
 ```
+Note: if there are issues with haiku, try running ```pip install git+https://github.com/deepmind/dm-haiku```
 
 - Rational Functions 
 Please look into https://github.com/ml-research/rational_activations. If you want to install cuda acceleration version, set `export "FORCE_CUDA"=1`
