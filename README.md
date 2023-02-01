@@ -1,7 +1,31 @@
-## Transformers with learnable activation functions
+# Transformers with learnable activation functions
 This repository incldues code and model for our EACL 2023 findings paper: [Transformers with learnale activation functions](https://arxiv.org/abs/2208.14111)
 
-> Abstract: Activation functions can have a significant impact on reducing the topological complexity of input data and therefore improve the performance of the model. Selecting a suitable activation function is an essential step in neural model design. However, the choice of activation function is seldom discussed or explored in Transformer-based language models. Their activation functions are chosen beforehand and then remain fixed from pre-training to fine-tuning. As a result, the inductive biases they imposed on models cannot be adjusted during this long life cycle. Moreover, subsequently developed models (e.g., RoBERTa, BART, and GPT-3) often follow up prior work (e.g., BERT) to use the same activation function without justification. In this paper, we investigate the effectiveness of using Rational Activation Function (RAF), a learnable activation function, in the Transformer architecture. In contrast to conventional, predefined activation functions, RAFs can adaptively learn optimal activation functions during training according to input data. Our experiments show the RAF-based Transformer (RAFT) achieves a lower validation perplexity than a vanilla BERT with the GELU function. We further evaluate RAFT on downstream tasks in low- and full-data settings. Our results show that RAFT outperforms the counterpart model across the majority of tasks and settings. For instance, RAFT outperforms vanilla BERT on the GLUE benchmark by 5.71 points on average in low-data scenario (where 100 training examples are available) and by 2.05 points on SQuAD in full-data setting. Analysis of the shapes of learned RAFs further unveils that they substantially vary between different layers of the pre-trained model and mostly look very different from conventional activation functions. RAFT opens a new research direction for analyzing and interpreting pre-trained models according to the learned activation functions.
+### Citation
+Please use the following citation:
+```
+@article{fang2022transformers,
+  title={Transformers with Learnable Activation Functions},
+  author={Fang, Haishuo and Lee, Ji-Ung and Moosavi, Nafise Sadat and Gurevych, Iryna},
+  journal={EACL Findings},
+  year={2023},
+  pages={(to appear)}
+}
+```
+
+> **Abstract:** Activation functions can have a significant impact on reducing the topological complexity of input data and therefore improve the performance of the model. Selecting a suitable activation function is an essential step in neural model design. However, the choice of activation function is seldom discussed or explored in Transformer-based language models. Their activation functions are chosen beforehand and then remain fixed from pre-training to fine-tuning. As a result, the inductive biases they imposed on models cannot be adjusted during this long life cycle. Moreover, subsequently developed models (e.g., RoBERTa, BART, and GPT-3) often follow up prior work (e.g., BERT) to use the same activation function without justification. In this paper, we investigate the effectiveness of using Rational Activation Function (RAF), a learnable activation function, in the Transformer architecture. In contrast to conventional, predefined activation functions, RAFs can adaptively learn optimal activation functions during training according to input data. Our experiments show the RAF-based Transformer (RAFT) achieves a lower validation perplexity than a vanilla BERT with the GELU function. We further evaluate RAFT on downstream tasks in low- and full-data settings. Our results show that RAFT outperforms the counterpart model across the majority of tasks and settings. For instance, RAFT outperforms vanilla BERT on the GLUE benchmark by 5.71 points on average in low-data scenario (where 100 training examples are available) and by 2.05 points on SQuAD in full-data setting. Analysis of the shapes of learned RAFs further unveils that they substantially vary between different layers of the pre-trained model and mostly look very different from conventional activation functions. RAFT opens a new research direction for analyzing and interpreting pre-trained models according to the learned activation functions.
+
+Contact person: Haishuo Fang, fang@tu-darmstadt.de
+
+https://www.ukp.tu-darmstadt.de/
+
+https://www.tu-darmstadt.de/
+
+
+Don't hesitate to send us an e-mail or report an issue, if something is broken (and it shouldn't be) or if you have further questions.
+
+> This repository contains experimental software and is published for the sole purpose of giving additional background details on the respective publication. 
+
 
 ### Structure
 ```
@@ -146,14 +170,4 @@ One needs to convert TriviaQA to the SQuAD format using `./triviaqa/convert_to_s
 ### Plot 
 To plot shapes of rational activation functions in different layers, use `python run_plot.py`.
 
-### Citation
-Please use the following citation:
-```
-@article{fang2022transformers,
-  title={Transformers with Learnable Activation Functions},
-  author={Fang, Haishuo and Lee, Ji-Ung and Moosavi, Nafise Sadat and Gurevych, Iryna},
-  journal={arXiv preprint arXiv:2208.14111},
-  year={2022}
-}
-```
 
