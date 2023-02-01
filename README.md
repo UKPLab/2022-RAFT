@@ -44,6 +44,27 @@ You can download the pertrained model here:
 
 Or you can pretrain it by yourself since it only takes less than one day to finish the pretraining stage.
 
+```bash
+    torchrun --nproc_per_node=2 \
+    --nnodes=1 \
+    --master_port 6067 \
+    run_mlm.py \
+    --do_train \
+    --do_eval \
+    --learning_rate $lr \                  # learning rate for parameters(exclude rational functions)
+    --rational_lr ${rlr} \              # parameters for rational functions
+    --preprocessing_num_workers 15 \
+    --rational_layers $rational_layers \ # how many layers needs to be rational activation functions
+    --approx_func gelu \
+    --run_name $run_name \ #used for wandb 
+    --output_dir ./outputs/acabert/$activate_func/$lr/"${layers}layers"/$optimizer/${run_name}/ \
+    --max_eval_samples 50000 \
+
+```
+- set `rational_layers` to '0-11,pooler' for RAFT and '' for FAFT.
+- Please check `./scripts` for detailed examples.
+
+
 - RAFT
 ```
 sbatch ./scripts/pretrain/raft.sh
@@ -56,64 +77,49 @@ sbatch ./scripts/pretrain/vanilla_BERT.sh
 ```
 
 ### Fine-Tuning
-- GLUE
-    - Low-data
-        - RAFT
-        ```
-        sbatch ./scripts/finetune/full-finetune/glue-raft-lr-array.sh
-        ```
-        - Vanilla BERT
-        ```
-        sbatch ./scripts/finetune/full-finetune/glue-vanilla-lr-array.sh
-        ```
-    - Full-data
-        - RAFT
-        ```
-        sbatch ./scripts/finetune/full-finetune/glue-raft-array.sh
-        ```
-        - Vanilla BERT
-        ```
-        sbatch ./scripts/finetune/full-finetune/glue-vanilla-array.sh
-        ```
-        
-- SQuAD
-    - Low-data
-        - RAFT
-        ```
-        sbatch ./scripts/finetune/full-finetune/squad-raft-lr-array.sh
-        ```
-        - Vanilla BERT
-        ```
-        sbatch ./scripts/finetune/full-finetune/squad-vanilla-lr-array.sh
-        ```
-    - Full-data
-        - RAFT
-        ```
-        sbatch ./scripts/finetune/full-finetune/squad-raft-array.sh
-        ```
-        - Vanilla BERT
-        ```
-        sbatch ./scripts/finetune/full-finetune/squad-vanilla-array.sh
-        ```
-- BitFit
-    - Low-data
-        - RAFT
-        ```
-        sbatch ./scripts/finetune/bitfit/glue-raft-lr-array.sh
-        ```
-        - Vanilla BERT
-        ```
-        sbatch ./scripts/finetune/bitfit/glue-vanilla-lr-array.sh
-        ```
-    - Full-data
-        - RAFT
-        ```
-        sbatch ./scripts/finetune/bitfit/glue-raft-array.sh
-        ```
-        - Vanilla BERT
-        ```
-        sbatch ./scripts/finetune/bitfit/glue-vanilla-array.sh
-        ```
+We fine-tuned our models on GLUE and SQuAD.
+```bash
+    python run_glue.py \
+    --model_name_or_path <MODEL_PATH> \
+    --task_name $task_name \                  # different task names in GLUE
+    --cache_dir ./data_temp \
+    --do_train \
+    --do_eval \
+    --do_predict \
+    --max_seq_length 128 \
+    --per_device_train_batch_size 32 \
+    --per_device_eval_batch_size 32 \
+    --num_warmup_steps 0 0 0 \
+    --evaluation_strategy epoch \
+    --learning_rate $lr \                      # learning rate for parameters(exclude rational functions)
+    --rational_lr ${rational_lr} \             # learning rate for rational activation functions
+    --rational_layers $rational_layers \       
+    --num_train_epochs 6 \
+    --output_dir <OUTPUT_DIR> \                # output directory 
+    --run_name  <RUN_NAME> \                   # used for wandb
+    --save_strategy epoch \
+    --logging_strategy epoch \
+    --seed ${seed} \                           # for multiple runs with different seeds                         
+    --academicBERT \
+```
+
+- set `rational_layers` to '0-11,pooler' for RAFT and '' for FAFT.
+- Please check `./scripts` for detailed examples.
+  - GLUE
+    - Low-data:  `./scripts/finetune/full-finetune/glue-<model_type>-lr-array.sh` 
+
+    - Full-data: `./scripts/finetune/full-finetune/glue-<model_type>-array.sh`
+
+  - SQuAD
+    - Low-data: `sbatch ./scripts/finetune/full-finetune/squad-<model_type>-lr-array.sh`
+
+    - Full-data: `./scripts/finetune/full-finetune/squad-<model_type>-array.sh`
+
+  - BitFit
+    - Low-data: `./scripts/finetune/bitfit/glue-<model_type>-lr-array.sh`
+
+    - Full-data: `./scripts/finetune/bitfit/glue-<model_type>-array.sh`
+  - Note: <model-type> could be raft or vanilla.   
     
 
 ### Zero-shot learning
