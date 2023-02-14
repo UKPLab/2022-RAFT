@@ -1,5 +1,5 @@
 # Transformers with learnable activation functions
-This repository incldues code and model for our EACL 2023 findings paper: [Transformers with learnale activation functions](https://arxiv.org/abs/2208.14111)
+This repository incldues code and model for our EACL 2023 findings paper: [Transformers with learnable activation functions](https://arxiv.org/abs/2208.14111)
 
 ### Citation
 Please use the following citation:
